@@ -64,7 +64,8 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     val APPEARANCE_PURE_BLACK = booleanPreferencesKey("appearance_pure_black")
     val APPEARANCE_NAV_ORDER = stringPreferencesKey("appearance_nav_order")
 
-    const val PROBE_PREFIX = "probe_"
+    const val PROBE_PREFIX = "probe_v2_"
+    const val LEGACY_PROBE_PREFIX = "probe_"
   }
 
   override val settings: Flow<AppSettings> =
@@ -168,7 +169,9 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
   override suspend fun clearProbeCache() {
     context.dataStore.edit { prefs ->
       val keysToRemove =
-        prefs.asMap().keys.filter { it.name.startsWith(Keys.PROBE_PREFIX) }
+        prefs.asMap().keys.filter {
+          it.name.startsWith(Keys.PROBE_PREFIX) || it.name.startsWith(Keys.LEGACY_PROBE_PREFIX)
+        }
       keysToRemove.forEach { prefs.remove(it) }
     }
   }
@@ -176,7 +179,9 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
   override suspend fun resetToDefaults() {
     context.dataStore.edit { prefs ->
       val nonProbeKeys =
-        prefs.asMap().keys.filter { !it.name.startsWith(Keys.PROBE_PREFIX) }
+        prefs.asMap().keys.filter {
+          !it.name.startsWith(Keys.PROBE_PREFIX) && !it.name.startsWith(Keys.LEGACY_PROBE_PREFIX)
+        }
       nonProbeKeys.forEach { prefs.remove(it) }
     }
   }

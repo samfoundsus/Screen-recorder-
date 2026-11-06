@@ -81,16 +81,34 @@ class SettingsViewModel(
       val probeState = uiState.value.resolutionProbeStates[resolution]
       val matchedCodec =
         if (probeState is OptionProbeState.Supported) {
-          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+          if (probeState.codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)"
         } else {
           null
         }
-      settingsRepository.updateVideoSettings {
-        it.copy(
+      val cappedFps =
+        if (probeState is OptionProbeState.Supported && probeState.codecLabel.contains("up to ")) {
+          probeState.codecLabel
+            .substringAfter("up to ")
+            .substringBefore(" ")
+            .toIntOrNull()
+        } else {
+          null
+        }
+      settingsRepository.updateVideoSettings { current ->
+        val nextFps =
+          if (cappedFps != null && current.fps > cappedFps) {
+            cappedFps
+          } else {
+            current.fps
+          }
+        current.copy(
           resolution = resolution,
-          codec = matchedCodec ?: it.codec,
+          fps = nextFps,
+          codec = matchedCodec ?: current.codec,
         )
       }
+      val orientation = uiState.value.settings.video.orientation
+      capabilitiesProvider.probeFpsForResolution(resolution, orientation)
     }
   }
 
@@ -99,7 +117,7 @@ class SettingsViewModel(
       val probeState = uiState.value.fpsProbeStates[fps]
       val matchedCodec =
         if (probeState is OptionProbeState.Supported) {
-          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+          if (probeState.codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)"
         } else {
           null
         }

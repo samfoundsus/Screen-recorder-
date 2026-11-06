@@ -726,12 +726,17 @@ private fun ProbedResolutionSettingsDialog(
   onSelect: (String) -> Unit,
   onDismiss: () -> Unit,
 ) {
+  val visibleOptions =
+    options
+      .filter { probeStates[it] !is OptionProbeState.Unsupported }
+      .ifEmpty { options }
+
   AlertDialog(
     onDismissRequest = onDismiss,
     title = { Text(text = "Resolution") },
     text = {
       Column {
-        options.forEach { option ->
+        visibleOptions.forEach { option ->
           val probeState = probeStates[option] ?: OptionProbeState.Probing
           val isUnsupported = probeState is OptionProbeState.Unsupported
           val isProbing =
@@ -813,12 +818,17 @@ private fun ProbedFpsSettingsDialog(
   onSelect: (Int) -> Unit,
   onDismiss: () -> Unit,
 ) {
+  val visibleOptions =
+    options
+      .filter { probeStates[it] !is OptionProbeState.Unsupported }
+      .ifEmpty { listOf(24, 30) }
+
   AlertDialog(
     onDismissRequest = onDismiss,
     title = { Text(text = "Frame rate") },
     text = {
       Column {
-        options.forEach { fps ->
+        visibleOptions.forEach { fps ->
           val probeState = probeStates[fps] ?: OptionProbeState.Probing
           val isUnsupported = probeState is OptionProbeState.Unsupported
           val isProbing =

@@ -482,9 +482,11 @@ class ScreenRecordingEngine(
     actualWidth = CapabilityProbe.roundDown16(resolvedSpec.width)
     actualHeight = CapabilityProbe.roundDown16(resolvedSpec.height)
     actualFps = resolvedSpec.fps
+    val configureFps = resolvedSpec.configureFps
     actualBitrateBps = resolvedSpec.bitrateBps
     actualVideoMime = resolvedSpec.mimeType
-    actualCodecLabel = if (resolvedSpec.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+    actualCodecLabel =
+      if (resolvedSpec.codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)"
 
     fun createEncoderInstance(): MediaCodec {
       val name = resolvedSpec.encoderName
@@ -497,18 +499,30 @@ class ScreenRecordingEngine(
 
     var encoder = createEncoderInstance()
     try {
-      val primaryFormat = buildPrimaryVideoFormat()
+      val primaryFormat = buildPrimaryVideoFormat(actualFps)
       encoder.configure(primaryFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
     } catch (firstErr: Throwable) {
       debugLog(
-        "Primary MediaFormat configure() failed (${firstErr.message}); retrying with fallback format"
+        "Primary MediaFormat configure(fps=$actualFps) failed (${firstErr.message}); retrying with configureFps=$configureFps"
       )
       try {
         encoder.release()
       } catch (_: Throwable) {}
       encoder = createEncoderInstance()
-      val fallbackFormat = buildFallbackVideoFormat()
-      encoder.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      try {
+        val clampedFormat = buildPrimaryVideoFormat(configureFps)
+        encoder.configure(clampedFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      } catch (secondErr: Throwable) {
+        debugLog(
+          "Clamped MediaFormat configure(fps=$configureFps) failed (${secondErr.message}); retrying with fallback format"
+        )
+        try {
+          encoder.release()
+        } catch (_: Throwable) {}
+        encoder = createEncoderInstance()
+        val fallbackFormat = buildFallbackVideoFormat(configureFps)
+        encoder.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      }
     }
 
     val inputSurface = encoder.createInputSurface()
@@ -536,14 +550,14 @@ class ScreenRecordingEngine(
    * KEY_BIT_RATE, KEY_FRAME_RATE, and KEY_I_FRAME_INTERVAL = 1.
    * Leaves KEY_BITRATE_MODE unset (device default).
    */
-  private fun buildPrimaryVideoFormat(): MediaFormat {
+  private fun buildPrimaryVideoFormat(frameRate: Int = actualFps): MediaFormat {
     return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
       setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
         MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
       )
       setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
-      setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
       setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
     }
   }
@@ -551,14 +565,14 @@ class ScreenRecordingEngine(
   /**
    * Fallback format that drops KEY_BITRATE_MODE and KEY_I_FRAME_INTERVAL.
    */
-  private fun buildFallbackVideoFormat(): MediaFormat {
+  private fun buildFallbackVideoFormat(frameRate: Int = actualFps): MediaFormat {
     return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
       setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
         MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
       )
       setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
-      setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
     }
   }
 

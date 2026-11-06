@@ -41,7 +41,8 @@ android {
       keyPassword = "android"
     }
     create("stable") {
-      storeFile = file("debug.keystore")
+      val repoKeystore = file("debug.keystore")
+      storeFile = if (repoKeystore.exists()) repoKeystore else file("${rootDir}/debug.keystore")
       storePassword = "android"
       keyAlias = "androiddebugkey"
       keyPassword = "android"

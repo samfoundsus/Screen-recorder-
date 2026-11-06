@@ -554,15 +554,21 @@ private fun ResolutionPickerDialog(
   onSelect: (String) -> Unit,
   onDismiss: () -> Unit,
 ) {
+  val visibleOptions =
+    options
+      .filter { probeStates[it] !is OptionProbeState.Unsupported }
+      .ifEmpty { options }
+
   AlertDialog(
     onDismissRequest = onDismiss,
     title = { Text("Resolution") },
     text = {
       Column {
-        options.forEach { option ->
+        visibleOptions.forEach { option ->
           val probeState = probeStates[option] ?: OptionProbeState.Probing
           val isUnsupported = probeState is OptionProbeState.Unsupported
-          val isProbing = probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val isProbing =
+            probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
           val summaryText =
             when (probeState) {
               is OptionProbeState.Supported -> probeState.codecLabel
@@ -634,15 +640,21 @@ private fun FpsPickerDialog(
   onSelect: (Int) -> Unit,
   onDismiss: () -> Unit,
 ) {
+  val visibleOptions =
+    options
+      .filter { probeStates[it] !is OptionProbeState.Unsupported }
+      .ifEmpty { listOf(24, 30) }
+
   AlertDialog(
     onDismissRequest = onDismiss,
     title = { Text("Frame rate") },
     text = {
       Column {
-        options.forEach { fps ->
+        visibleOptions.forEach { fps ->
           val probeState = probeStates[fps] ?: OptionProbeState.Probing
           val isUnsupported = probeState is OptionProbeState.Unsupported
-          val isProbing = probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val isProbing =
+            probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
           val summaryText =
             when (probeState) {
               is OptionProbeState.Supported -> probeState.codecLabel
