@@ -20,9 +20,8 @@ import android.media.projection.MediaProjection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
@@ -31,6 +30,8 @@ import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
 import com.example.BuildConfig
+import com.example.data.repository.RecordingMediaCache
+import com.example.domain.model.VideoMetadata
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -82,7 +83,7 @@ class ScreenRecordingEngine(
     private const val AUDIO_CHANNEL_COUNT = 2
     private const val AUDIO_BITRATE = 128_000
     private const val PCM_FRAMES_PER_READ = 1024
-    private const val DEQUEUE_TIMEOUT_US = 10_000L
+    private const val DEQUEUE_TIMEOUT_US = 10_000L // 10 ms timeout
     private const val EOS_DRAIN_TIMEOUT_MS = 3_000L
     private const val PARAMETER_KEY_SUSPEND_VIDEO_INPUT = MediaCodec.PARAMETER_KEY_SUSPEND
 
@@ -122,7 +123,8 @@ class ScreenRecordingEngine(
           val pathCol = cursor.getColumnIndex(MediaStore.Video.Media.RELATIVE_PATH)
           var deletedCount = 0
           while (cursor.moveToNext()) {
-            val relPath = if (pathCol >= 0 && !cursor.isNull(pathCol)) cursor.getString(pathCol) else ""
+            val relPath =
+              if (pathCol >= 0 && !cursor.isNull(pathCol)) cursor.getString(pathCol) else ""
             if (relPath.isNullOrEmpty() || relPath.contains("ScreenRecorder", ignoreCase = true)) {
               val id = cursor.getLong(idCol)
               val itemUri =
@@ -156,30 +158,25 @@ class ScreenRecordingEngine(
   private var parcelFileDescriptor: ParcelFileDescriptor? = null
   private var mediaMuxer: MediaMuxer? = null
 
-  private val drainLock = Any()
+  private val muxerLock = Any()
   @Volatile private var muxerStarted = false
   @Volatile private var videoTrackIndex = -1
   @Volatile private var audioTrackIndex = -1
   @Volatile private var activeAudioPipeline = false
   @Volatile private var engineStartRealtimeMs = 0L
 
-  // Timestamp normalization and monotonic tracking (starting near 0 us per track)
-  private var videoBaseRawPtsUs: Long = -1L
-  private var lastVideoMuxedPtsUs: Long = -1L
-  private var videoSamplesWritten: Int = 0
-  private var videoEosReceived: Boolean = false
+  @Volatile private var videoSamplesWritten: Int = 0
+  @Volatile private var videoEosReceived: Boolean = false
 
-  private var audioBaseRawPtsUs: Long = -1L
-  private var lastAudioMuxedPtsUs: Long = -1L
-  private var audioSamplesWritten: Int = 0
-  private var audioEosReceived: Boolean = false
+  @Volatile private var audioSamplesWritten: Int = 0
+  @Volatile private var audioEosReceived: Boolean = false
   @Volatile private var totalAudioFramesFed: Long = 0L
+  @Volatile private var audioStartBasePtsUs: Long = -1L
 
   private var videoEncoder: MediaCodec? = null
   private var videoInputSurface: Surface? = null
   private var virtualDisplay: VirtualDisplay? = null
-  private var drainThread: HandlerThread? = null
-  private var drainHandler: Handler? = null
+  private var videoDrainThread: Thread? = null
 
   private var audioEncoder: MediaCodec? = null
   private var micAudioRecord: AudioRecord? = null
@@ -190,10 +187,11 @@ class ScreenRecordingEngine(
   private val reusableVideoBufferInfo = MediaCodec.BufferInfo()
   private val reusableAudioBufferInfo = MediaCodec.BufferInfo()
 
-  private var actualWidth = 1080
+  private var actualWidth = 1072
   private var actualHeight = 1920
+  private var actualShortSide = 1080
   private var actualFps = 60
-  private var actualBitrateBps = 16_000_000
+  private var actualBitrateBps = 12_000_000
 
   fun start() {
     try {
@@ -214,13 +212,13 @@ class ScreenRecordingEngine(
       engineStartRealtimeMs = SystemClock.elapsedRealtime()
       isRunning.set(true)
 
+      startHighPriorityVideoDrainThread()
       if (activeAudioPipeline) {
         startAudioInputFeederThread()
       }
-      startPeriodicEncoderDrain()
 
       debugLog(
-        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, audio=$activeAudioPipeline, uri=$pendingOutputUri"
+        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, bitrate=${actualBitrateBps / 1_000_000}Mbps, audio=$activeAudioPipeline, uri=$pendingOutputUri"
       )
     } catch (t: Throwable) {
       debugLog("Failed to start ScreenRecordingEngine: ${t.message}", t)
@@ -261,162 +259,163 @@ class ScreenRecordingEngine(
 
   /**
    * Ordered, sequential stop and finalize routine executed on the background thread (steps a-f).
-   * Step g (publishing to library/playback) is performed by the caller immediately after this returns.
+   * Returns the finalized MediaStore [Uri] if successful, or null if failed/empty.
    */
-  fun stopAndFinalize(recordedDurationMs: Long): SavedRecordingMetadata? {
+  fun stopAndFinalize(): Uri? {
     if (isStopping.getAndSet(true)) return null
     if (isPaused.get()) {
       resume()
     }
     isRunning.set(false)
 
-    // Stop the background audio feeder and periodic drain handler so this background thread
-    // has exclusive, sequential ownership of the encoders and muxer.
+    // Stop the background audio feeder and high-priority video drain loop so this background thread
+    // has exclusive, sequential ownership for steps a-f.
     try {
       audioFeederThread?.join(1_000L)
     } catch (_: Throwable) {}
     audioFeederThread = null
 
     try {
-      drainHandler?.removeCallbacksAndMessages(null)
-      drainThread?.quitSafely()
-      drainThread?.join(1_000L)
+      videoDrainThread?.join(1_000L)
     } catch (_: Throwable) {}
-    drainHandler = null
-    drainThread = null
+    videoDrainThread = null
 
-    synchronized(drainLock) {
-      // STEP a: Stop feeding input: release VirtualDisplay, signal EOS on video and audio encoders
-      try {
-        virtualDisplay?.release()
-        virtualDisplay = null
+    // STEP a: Stop feeding input: release VirtualDisplay, signal EOS on video and audio encoders
+    try {
+      virtualDisplay?.release()
+      virtualDisplay = null
 
-        videoEncoder?.signalEndOfInputStream()
+      videoEncoder?.signalEndOfInputStream()
 
-        if (activeAudioPipeline) {
-          queueAudioEndOfStream()
-        }
-        debugLog(
-          "Step a (Stop feeding input & signal EOS) succeeded: virtualDisplay released, video/audio EOS signaled"
-        )
-      } catch (t: Throwable) {
-        debugLog("Step a (Stop feeding input & signal EOS) exception: ${t.message}", t)
+      if (activeAudioPipeline) {
+        queueAudioEndOfStream()
       }
+      debugLog(
+        "Step a (Stop feeding input & signal EOS) succeeded: virtualDisplay released, video/audio EOS signaled"
+      )
+    } catch (t: Throwable) {
+      debugLog("Step a (Stop feeding input & signal EOS) exception: ${t.message}", t)
+    }
 
-      // STEP b: Drain both encoders until each emits BUFFER_FLAG_END_OF_STREAM (3s timeout per encoder)
-      try {
-        drainEncodersUntilEosSequential()
-        debugLog(
-          "Step b (Drain encoders until EOS) succeeded: videoSamples=$videoSamplesWritten (eos=$videoEosReceived), audioSamples=$audioSamplesWritten (eos=$audioEosReceived)"
-        )
-      } catch (t: Throwable) {
-        debugLog("Step b (Drain encoders until EOS) exception: ${t.message}", t)
-      }
+    // STEP b: Drain both encoders until each emits BUFFER_FLAG_END_OF_STREAM (3s timeout per encoder)
+    try {
+      drainEncodersUntilEosSequential()
+      debugLog(
+        "Step b (Drain encoders until EOS) succeeded: videoSamples=$videoSamplesWritten (eos=$videoEosReceived), audioSamples=$audioSamplesWritten (eos=$audioEosReceived)"
+      )
+    } catch (t: Throwable) {
+      debugLog("Step b (Drain encoders until EOS) exception: ${t.message}", t)
+    }
 
-      // STEP c: Stop and release the encoders and AudioRecord
-      try {
-        stopAndReleaseEncodersAndAudioRecord()
-        debugLog("Step c (Stop and release encoders and AudioRecord) succeeded")
-      } catch (t: Throwable) {
-        debugLog("Step c (Stop and release encoders and AudioRecord) exception: ${t.message}", t)
-      }
+    // STEP c: Stop and release the encoders and AudioRecord
+    try {
+      stopAndReleaseEncodersAndAudioRecord()
+      debugLog("Step c (Stop and release encoders and AudioRecord) succeeded")
+    } catch (t: Throwable) {
+      debugLog("Step c (Stop and release encoders and AudioRecord) exception: ${t.message}", t)
+    }
 
-      // STEP d: Call muxer.stop() inside try/catch, log exception if any, then muxer.release()
-      var muxerStoppedCleanly = false
-      val muxer = mediaMuxer
+    // STEP d: Call muxer.stop() inside try/catch, log exception if any, then muxer.release()
+    var muxerStoppedCleanly = false
+    val muxer: MediaMuxer?
+    synchronized(muxerLock) {
+      muxer = mediaMuxer
       mediaMuxer = null
-      if (muxer != null) {
-        try {
-          if (muxerStarted && (videoSamplesWritten > 0 || audioSamplesWritten > 0)) {
-            muxer.stop()
-            muxerStoppedCleanly = true
-            debugLog("Step d (muxer.stop) succeeded")
-          } else {
-            debugLog(
-              "Step d (muxer.stop) skipped: muxerStarted=$muxerStarted, videoSamples=$videoSamplesWritten, audioSamples=$audioSamplesWritten"
-            )
-          }
-        } catch (t: Throwable) {
-          debugLog("Step d (muxer.stop) exception: ${t.message}", t)
-        } finally {
-          try {
-            muxer.release()
-            debugLog("Step d (muxer.release) succeeded")
-          } catch (t: Throwable) {
-            debugLog("Step d (muxer.release) exception: ${t.message}", t)
-          }
-          muxerStarted = false
-        }
-      }
-
-      // STEP e: Close the ParcelFileDescriptor
+    }
+    if (muxer != null) {
       try {
-        parcelFileDescriptor?.let { pfd ->
-          try {
-            pfd.fileDescriptor?.sync()
-          } catch (_: Throwable) {}
-          pfd.close()
-        }
-        parcelFileDescriptor = null
-        debugLog("Step e (Close ParcelFileDescriptor) succeeded")
-      } catch (t: Throwable) {
-        parcelFileDescriptor = null
-        debugLog("Step e (Close ParcelFileDescriptor) exception: ${t.message}", t)
-      }
-
-      // STEP f: Only after closing ParcelFileDescriptor, update IS_PENDING = 0 (or delete if failed)
-      val uri = pendingOutputUri
-      pendingOutputUri = null
-      isCleanedUp.set(true)
-
-      if (uri == null) {
-        debugLog("Step f: No pending MediaStore Uri to finalize")
-        return null
-      }
-
-      if (muxerStoppedCleanly && videoSamplesWritten > 0) {
-        return try {
-          val values =
-            ContentValues().apply {
-              put(MediaStore.Video.Media.IS_PENDING, 0)
-            }
-          val updatedRows = context.contentResolver.update(uri, values, null, null)
-          val fileSize = queryUriSize(uri)
+        if (muxerStarted && (videoSamplesWritten > 0 || audioSamplesWritten > 0)) {
+          muxer.stop()
+          muxerStoppedCleanly = true
+          debugLog("Step d (muxer.stop) succeeded")
+        } else {
           debugLog(
-            "Step f (Clear IS_PENDING=0) succeeded: rowsUpdated=$updatedRows, finalUri=$uri, fileSize=$fileSize bytes"
+            "Step d (muxer.stop) skipped: muxerStarted=$muxerStarted, videoSamples=$videoSamplesWritten, audioSamples=$audioSamplesWritten"
           )
+        }
+      } catch (t: Throwable) {
+        debugLog("Step d (muxer.stop) exception: ${t.message}", t)
+      } finally {
+        try {
+          muxer.release()
+          debugLog("Step d (muxer.release) succeeded")
+        } catch (t: Throwable) {
+          debugLog("Step d (muxer.release) exception: ${t.message}", t)
+        }
+        muxerStarted = false
+      }
+    }
 
-          SavedRecordingMetadata(
-            contentUri = uri,
-            displayName = outputDisplayName.removeSuffix(".mp4"),
-            durationMs = recordedDurationMs.coerceAtLeast(1_000L),
-            sizeBytes = fileSize.coerceAtLeast(1_024L),
-            resolution = "${min(actualWidth, actualHeight)}p (${actualWidth}×${actualHeight})",
+    // STEP e: Close the ParcelFileDescriptor
+    try {
+      parcelFileDescriptor?.let { pfd ->
+        try {
+          pfd.fileDescriptor?.sync()
+        } catch (_: Throwable) {}
+        pfd.close()
+      }
+      parcelFileDescriptor = null
+      debugLog("Step e (Close ParcelFileDescriptor) succeeded")
+    } catch (t: Throwable) {
+      parcelFileDescriptor = null
+      debugLog("Step e (Close ParcelFileDescriptor) exception: ${t.message}", t)
+    }
+
+    // STEP f: Only after closing ParcelFileDescriptor, update IS_PENDING = 0 (or delete if failed)
+    val uri = pendingOutputUri
+    pendingOutputUri = null
+    isCleanedUp.set(true)
+
+    if (uri == null) {
+      debugLog("Step f: No pending MediaStore Uri to finalize")
+      return null
+    }
+
+    if (muxerStoppedCleanly && videoSamplesWritten > 0) {
+      return try {
+        val uriString = uri.toString()
+        RecordingMediaCache.putMetadata(
+          uriString,
+          VideoMetadata(
+            width = actualWidth,
+            height = actualHeight,
+            resolution = RecordingMediaCache.formatResolutionLabel(actualWidth, actualHeight),
             fps = actualFps,
             bitrateMbps = (actualBitrateBps / 1_000_000).coerceAtLeast(1),
             codec = "AVC (H.264)",
-            container = "MP4",
-            hasMicAudio = config.wantsMicAudio && activeAudioPipeline,
-            audioChannelMode = config.audioChannelMode,
-          )
-        } catch (t: Throwable) {
-          debugLog("Step f (Clear IS_PENDING=0) exception: ${t.message}", t)
-          try {
-            context.contentResolver.delete(uri, null, null)
-          } catch (_: Throwable) {}
-          null
-        }
-      } else {
+          ),
+        )
+        val values =
+          ContentValues().apply {
+            put(MediaStore.Video.Media.IS_PENDING, 0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+              put(MediaStore.Video.Media.CAPTURE_FRAMERATE, actualFps.toFloat())
+            }
+          }
+        val updatedRows = context.contentResolver.update(uri, values, null, null)
+        context.contentResolver.notifyChange(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, null)
+        val fileSize = queryUriSize(uri)
+        debugLog(
+          "Step f (Clear IS_PENDING=0) succeeded: rowsUpdated=$updatedRows, finalUri=$uri, fileSize=$fileSize bytes"
+        )
+        uri
+      } catch (t: Throwable) {
+        debugLog("Step f (Clear IS_PENDING=0) exception: ${t.message}", t)
         try {
           context.contentResolver.delete(uri, null, null)
-          debugLog(
-            "Step f: Deleted pending MediaStore row ($uri) because muxerStoppedCleanly=$muxerStoppedCleanly, videoSamples=$videoSamplesWritten"
-          )
-        } catch (t: Throwable) {
-          debugLog("Step f (Delete failed pending row) exception: ${t.message}", t)
-        }
-        return null
+        } catch (_: Throwable) {}
+        null
       }
+    } else {
+      try {
+        context.contentResolver.delete(uri, null, null)
+        debugLog(
+          "Step f: Deleted pending MediaStore row ($uri) because muxerStoppedCleanly=$muxerStoppedCleanly, videoSamples=$videoSamplesWritten"
+        )
+      } catch (t: Throwable) {
+        debugLog("Step f (Delete failed pending row) exception: ${t.message}", t)
+      }
+      return null
     }
   }
 
@@ -473,7 +472,7 @@ class ScreenRecordingEngine(
         else -> screenW > screenH
       }
 
-    val shortSideTarget =
+    val requestedShortSide =
       when {
         config.resolutionLabel.startsWith("1440") -> 1440
         config.resolutionLabel.startsWith("1080") -> 1080
@@ -481,33 +480,48 @@ class ScreenRecordingEngine(
         config.resolutionLabel.startsWith("480") -> 480
         else -> min(screenW, screenH)
       }
-
+    val requestedFps = config.fps.coerceIn(15, 120)
     val aspect = max(screenW, screenH).toDouble() / min(screenW, screenH).toDouble()
-    val rawShort = roundEven(shortSideTarget)
-    val rawLong = roundEven((rawShort * aspect).roundToInt())
 
-    val desiredWidth = if (wantLandscape) rawLong else rawShort
-    val desiredHeight = if (wantLandscape) rawShort else rawLong
-    val desiredFps = config.fps.coerceIn(15, 120)
-    val desiredBitrate = (config.bitrateMbps.coerceIn(1, 64)) * 1_000_000
-
+    // Select H.264 hardware encoder
     val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-    val avcEncoderInfo =
-      codecList.codecInfos.firstOrNull { info ->
+    val avcEncoders =
+      codecList.codecInfos.filter { info ->
         info.isEncoder && info.supportedTypes.any { it.equals(VIDEO_MIME, ignoreCase = true) }
       }
+    val avcEncoderInfo =
+      avcEncoders.firstOrNull { info ->
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+          info.isHardwareAccelerated
+        } else {
+          !info.name.startsWith("OMX.google.", ignoreCase = true) &&
+            !info.name.startsWith("c2.android.", ignoreCase = true)
+        }
+      } ?: avcEncoders.firstOrNull()
 
-    val videoCaps: MediaCodecInfo.VideoCapabilities? =
-      avcEncoderInfo?.getCapabilitiesForType(VIDEO_MIME)?.videoCapabilities
+    val codecCaps: MediaCodecInfo.CodecCapabilities? =
+      try {
+        avcEncoderInfo?.getCapabilitiesForType(VIDEO_MIME)
+      } catch (_: Throwable) {
+        null
+      }
+    val videoCaps: MediaCodecInfo.VideoCapabilities? = codecCaps?.videoCapabilities
 
-    if (videoCaps != null) {
-      val wAlign = max(2, videoCaps.widthAlignment)
-      val hAlign = max(2, videoCaps.heightAlignment)
+    // Round down width and height to multiples of 16 before configuring the encoder
+    fun compute16AlignedDimensions(shortSideTarget: Int): Pair<Int, Int> {
+      val rawShort = roundDown16(shortSideTarget)
+      val rawLong = roundDown16((shortSideTarget * aspect).roundToInt())
+      val desiredW = if (wantLandscape) rawLong else rawShort
+      val desiredH = if (wantLandscape) rawShort else rawLong
+      if (videoCaps == null) return desiredW to desiredH
+
+      val wAlign = max(16, alignUpTo16(videoCaps.widthAlignment))
+      val hAlign = max(16, alignUpTo16(videoCaps.heightAlignment))
 
       val supportedWidths = videoCaps.supportedWidths
       val clampedW =
-        alignTo(
-          desiredWidth.coerceIn(supportedWidths.lower, supportedWidths.upper),
+        alignDown(
+          desiredW.coerceIn(supportedWidths.lower, supportedWidths.upper),
           wAlign,
         ).coerceIn(supportedWidths.lower, supportedWidths.upper)
 
@@ -518,64 +532,122 @@ class ScreenRecordingEngine(
           videoCaps.supportedHeights
         }
       val clampedH =
-        alignTo(
-          desiredHeight.coerceIn(supportedHeights.lower, supportedHeights.upper),
+        alignDown(
+          desiredH.coerceIn(supportedHeights.lower, supportedHeights.upper),
           hAlign,
         ).coerceIn(supportedHeights.lower, supportedHeights.upper)
-
-      val fpsRange =
-        try {
-          videoCaps.getSupportedFrameRatesFor(clampedW, clampedH)
-        } catch (_: Throwable) {
-          videoCaps.supportedFrameRates
-        }
-      val clampedFps =
-        desiredFps
-          .toDouble()
-          .coerceIn(fpsRange.lower.toDouble(), fpsRange.upper.toDouble())
-          .roundToInt()
-          .coerceAtLeast(15)
-
-      val bitrateRange = videoCaps.bitrateRange
-      val clampedBitrate = desiredBitrate.coerceIn(bitrateRange.lower, bitrateRange.upper)
-
-      actualWidth = clampedW
-      actualHeight = clampedH
-      actualFps = clampedFps
-      actualBitrateBps = clampedBitrate
-    } else {
-      actualWidth = roundEven(desiredWidth)
-      actualHeight = roundEven(desiredHeight)
-      actualFps = desiredFps
-      actualBitrateBps = desiredBitrate
+      return roundDown16(clampedW) to roundDown16(clampedH)
     }
 
-    val format =
-      MediaFormat.createVideoFormat(VIDEO_MIME, actualWidth, actualHeight).apply {
-        setInteger(
-          MediaFormat.KEY_COLOR_FORMAT,
-          MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
-        )
-        setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
-        setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
-        setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        // Repeat previous frame every 100ms when screen is static so surface encoder always emits frames
-        setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+    fun selectSupportedFpsForSize(width: Int, height: Int, targetFps: Int): Int? {
+      if (videoCaps == null) return targetFps
+      if (!videoCaps.isSizeSupported(width, height)) return null
+      val fpsRange =
+        try {
+          videoCaps.getSupportedFrameRatesFor(width, height)
+        } catch (_: Throwable) {
+          return null
+        }
+      val upperFps = fpsRange.upper.toInt()
+      val lowerFps = fpsRange.lower.roundToInt().coerceAtLeast(15)
+      if (upperFps < 15) return null
+      if (targetFps in lowerFps..upperFps) return targetFps
+
+      val standardRates = listOf(120, 90, 60, 30, 24)
+      val nearestStandard =
+        standardRates.firstOrNull { it <= targetFps && it in lowerFps..upperFps }
+      return nearestStandard ?: targetFps.coerceIn(lowerFps, upperFps)
+    }
+
+    if (videoCaps != null) {
+      val (candW, candH) = compute16AlignedDimensions(requestedShortSide)
+      val candShortSide = min(candW, candH)
+      val candFps = selectSupportedFpsForSize(candW, candH, requestedFps)
+
+      // If 1440p at requested fps is not supported, drop to nearest supported frame rate first, then to 1080p
+      if (requestedShortSide >= 1440 && (candShortSide < 1300 || candFps == null || candFps < 24)) {
+        val (w1080, h1080) = compute16AlignedDimensions(1080)
+        val fps1080 =
+          selectSupportedFpsForSize(w1080, h1080, requestedFps)
+            ?: selectSupportedFpsForSize(w1080, h1080, 60)
+            ?: 30
+        actualWidth = w1080
+        actualHeight = h1080
+        actualFps = fps1080
+      } else if (candFps != null) {
+        actualWidth = candW
+        actualHeight = candH
+        actualFps = candFps
+      } else {
+        val fallbackShort = if (requestedShortSide > 720) 720 else 480
+        val (fbW, fbH) = compute16AlignedDimensions(fallbackShort)
+        val fbFps = selectSupportedFpsForSize(fbW, fbH, min(requestedFps, 60)) ?: 30
+        actualWidth = fbW
+        actualHeight = fbH
+        actualFps = fbFps
+      }
+    } else {
+      val (w, h) = compute16AlignedDimensions(requestedShortSide)
+      actualWidth = w
+      actualHeight = h
+      actualFps = requestedFps
+    }
+
+    // Ensure final width and height are strictly multiples of 16 (round down)
+    actualWidth = roundDown16(actualWidth)
+    actualHeight = roundDown16(actualHeight)
+
+    actualShortSide =
+      when {
+        min(actualWidth, actualHeight) >= 1300 -> 1440
+        min(actualWidth, actualHeight) >= 1000 -> 1080
+        min(actualWidth, actualHeight) >= 640 -> 720
+        else -> 480
       }
 
-    val encoder =
-      if (avcEncoderInfo != null) {
+    // Cap default bitrate at 12 Mbps for 1080p and 20 Mbps for 1440p, and never exceed getBitrateRange().upper
+    val maxBitrateMbpsForTier = if (actualShortSide >= 1440) 20 else 12
+    val requestedMbps = config.bitrateMbps.coerceAtLeast(1)
+    val cappedBitrateBps = min(requestedMbps, maxBitrateMbpsForTier) * 1_000_000
+    actualBitrateBps =
+      if (videoCaps != null) {
+        val bitrateRange = videoCaps.bitrateRange
+        cappedBitrateBps.coerceIn(bitrateRange.lower, bitrateRange.upper)
+      } else {
+        cappedBitrateBps
+      }
+
+    fun createEncoderInstance(): MediaCodec {
+      return if (avcEncoderInfo != null) {
         MediaCodec.createByCodecName(avcEncoderInfo.name)
       } else {
         MediaCodec.createEncoderByType(VIDEO_MIME)
       }
-    encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    }
+
+    var encoder = createEncoderInstance()
+    try {
+      val primaryFormat = buildPrimaryVideoFormat()
+      encoder.configure(primaryFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    } catch (firstErr: Throwable) {
+      debugLog(
+        "Primary MediaFormat configure() failed (${firstErr.message}); retrying with fallback format"
+      )
+      try {
+        encoder.release()
+      } catch (_: Throwable) {}
+      encoder = createEncoderInstance()
+      val fallbackFormat = buildFallbackVideoFormat()
+      encoder.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    }
+
     val inputSurface = encoder.createInputSurface()
     encoder.start()
 
     videoEncoder = encoder
     videoInputSurface = inputSurface
 
+    // Create VirtualDisplay at the same 16-aligned size with VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR and encoder input Surface only
     virtualDisplay =
       mediaProjection.createVirtualDisplay(
         "PixelScreenRecorderDisplay",
@@ -587,6 +659,37 @@ class ScreenRecordingEngine(
         null,
         null,
       )
+  }
+
+  /**
+   * Uses only: MIME video/avc, width, height, KEY_COLOR_FORMAT = COLOR_FormatSurface,
+   * KEY_BIT_RATE, KEY_FRAME_RATE, and KEY_I_FRAME_INTERVAL = 1.
+   * Leaves KEY_BITRATE_MODE unset (device default).
+   */
+  private fun buildPrimaryVideoFormat(): MediaFormat {
+    return MediaFormat.createVideoFormat(VIDEO_MIME, actualWidth, actualHeight).apply {
+      setInteger(
+        MediaFormat.KEY_COLOR_FORMAT,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+      )
+      setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
+      setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+    }
+  }
+
+  /**
+   * Fallback format that drops KEY_BITRATE_MODE and KEY_I_FRAME_INTERVAL.
+   */
+  private fun buildFallbackVideoFormat(): MediaFormat {
+    return MediaFormat.createVideoFormat(VIDEO_MIME, actualWidth, actualHeight).apply {
+      setInteger(
+        MediaFormat.KEY_COLOR_FORMAT,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+      )
+      setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
+    }
   }
 
   @SuppressLint("MissingPermission")
@@ -696,10 +799,57 @@ class ScreenRecordingEngine(
     }
   }
 
+  /**
+   * Dedicated high-priority thread for draining the hardware video encoder output.
+   * Never blocks on audio; uses dequeueOutputBuffer with a 10 ms timeout.
+   */
+  private fun startHighPriorityVideoDrainThread() {
+    val thread =
+      Thread(
+        {
+          try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
+          } catch (_: Throwable) {}
+
+          val vCodec = videoEncoder ?: return@Thread
+
+          while (isRunning.get() && !isStopping.get() && !videoEosReceived) {
+            try {
+              if (
+                !muxerStarted &&
+                  videoTrackIndex >= 0 &&
+                  activeAudioPipeline &&
+                  (SystemClock.elapsedRealtime() - engineStartRealtimeMs) > 400L
+              ) {
+                synchronized(muxerLock) {
+                  if (!muxerStarted && videoTrackIndex >= 0) {
+                    activeAudioPipeline = false
+                    audioEosReceived = true
+                    maybeStartMuxerLocked()
+                  }
+                }
+              }
+
+              drainVideoCodecStep(vCodec)
+            } catch (_: Throwable) {
+              if (!isRunning.get() || isStopping.get()) break
+            }
+          }
+        },
+        "RecorderVideoDrain",
+      )
+    videoDrainThread = thread
+    thread.start()
+  }
+
   private fun startAudioInputFeederThread() {
     val thread =
       Thread(
         {
+          try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO)
+          } catch (_: Throwable) {}
+
           val stereoSamplesPerChunk = PCM_FRAMES_PER_READ * AUDIO_CHANNEL_COUNT
           val micPcm = ShortArray(stereoSamplesPerChunk)
           val internalPcm = ShortArray(stereoSamplesPerChunk)
@@ -760,7 +910,6 @@ class ScreenRecordingEngine(
                     micSamplesRead > 0 -> micSamplesRead
                     intSamplesRead > 0 -> intSamplesRead
                     else -> {
-                      // When generating silence, pace to real time (~23ms per 1024 frames)
                       Thread.sleep(20L)
                       stereoSamplesPerChunk
                     }
@@ -784,12 +933,18 @@ class ScreenRecordingEngine(
                 directPcmBytes.limit(safeBytes)
                 inputBuf?.put(directPcmBytes)
 
-                val ptsUs = (totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE
+                if (audioStartBasePtsUs < 0L) {
+                  audioStartBasePtsUs = (System.nanoTime() / 1_000L) - totalPausedDurationUs
+                }
+                val ptsUs =
+                  audioStartBasePtsUs + ((totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE)
                 val framesInChunk = (safeBytes / 2) / AUDIO_CHANNEL_COUNT
                 totalAudioFramesFed += framesInChunk
 
                 codec.queueInputBuffer(inIndex, 0, safeBytes, ptsUs, 0)
               }
+
+              drainAudioCodecStep(codec)
             }
           } catch (_: Throwable) {
             // Exits cleanly when stopping
@@ -801,65 +956,129 @@ class ScreenRecordingEngine(
     thread.start()
   }
 
-  private fun startPeriodicEncoderDrain() {
-    val thread = HandlerThread("RecorderVideoDrain")
-    thread.start()
-    val handler = Handler(thread.looper)
-    drainThread = thread
-    drainHandler = handler
+  /**
+   * Drains output buffers from the video encoder using a 10 ms timeout.
+   * Preserves original presentationTimeUs for all non-paused frames and skips codec-config buffers.
+   */
+  private fun drainVideoCodecStep(codec: MediaCodec): Boolean {
+    if (!muxerStarted && videoTrackIndex >= 0) {
+      Thread.sleep(2L)
+      return false
+    }
 
-    val drainRunnable =
-      object : Runnable {
-        override fun run() {
-          if (!isRunning.get() || isStopping.get()) return
-          synchronized(drainLock) {
-            if (isRunning.get() && !isStopping.get()) {
-              drainAvailableOutputNonBlocking()
+    var drainedAny = false
+    while (true) {
+      val outIndex = codec.dequeueOutputBuffer(reusableVideoBufferInfo, DEQUEUE_TIMEOUT_US)
+      when {
+        outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+          drainedAny = true
+          synchronized(muxerLock) {
+            if (!muxerStarted && videoTrackIndex < 0) {
+              val outFormat = codec.outputFormat
+              try {
+                if (!outFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                  outFormat.setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !outFormat.containsKey(MediaFormat.KEY_CAPTURE_RATE)) {
+                  outFormat.setInteger(MediaFormat.KEY_CAPTURE_RATE, actualFps)
+                }
+              } catch (_: Throwable) {}
+              videoTrackIndex = mediaMuxer?.addTrack(outFormat) ?: -1
+              maybeStartMuxerLocked()
             }
           }
-          if (isRunning.get() && !isStopping.get()) {
-            handler.postDelayed(this, 10L)
+          if (!muxerStarted) break
+        }
+        outIndex >= 0 -> {
+          drainedAny = true
+          val encodedData = codec.getOutputBuffer(outIndex)
+          val flags = reusableVideoBufferInfo.flags
+          val isConfigBuffer = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+          val isEos = (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+
+          if (!isConfigBuffer && reusableVideoBufferInfo.size > 0 && encodedData != null && muxerStarted && videoTrackIndex >= 0) {
+            val pausedOffsetUs = totalPausedDurationUs
+            if (pausedOffsetUs > 0L) {
+              reusableVideoBufferInfo.presentationTimeUs -= pausedOffsetUs
+            }
+
+            encodedData.position(reusableVideoBufferInfo.offset)
+            encodedData.limit(reusableVideoBufferInfo.offset + reusableVideoBufferInfo.size)
+            synchronized(muxerLock) {
+              if (muxerStarted) {
+                mediaMuxer?.writeSampleData(videoTrackIndex, encodedData, reusableVideoBufferInfo)
+                videoSamplesWritten++
+              }
+            }
+          }
+
+          codec.releaseOutputBuffer(outIndex, false)
+
+          if (isEos) {
+            videoEosReceived = true
+            break
           }
         }
       }
-    handler.post(drainRunnable)
+    }
+    return drainedAny
   }
 
-  private fun drainAvailableOutputNonBlocking() {
-    val vCodec = videoEncoder
-    val aCodec = audioEncoder
-
-    // 1. If video format is not yet known, peek video encoder for INFO_OUTPUT_FORMAT_CHANGED
-    if (vCodec != null && videoTrackIndex < 0) {
-      drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = true)
+  private fun drainAudioCodecStep(codec: MediaCodec): Boolean {
+    if (!muxerStarted && audioTrackIndex >= 0) {
+      return false
     }
 
-    // 2. If audio is active and audio format is not yet known, peek audio encoder for INFO_OUTPUT_FORMAT_CHANGED
-    if (activeAudioPipeline && aCodec != null && audioTrackIndex < 0) {
-      drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = true)
-    }
+    var drainedAny = false
+    while (true) {
+      val outIndex = codec.dequeueOutputBuffer(reusableAudioBufferInfo, DEQUEUE_TIMEOUT_US)
+      when {
+        outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+          drainedAny = true
+          synchronized(muxerLock) {
+            if (!muxerStarted && audioTrackIndex < 0) {
+              audioTrackIndex = mediaMuxer?.addTrack(codec.outputFormat) ?: -1
+              maybeStartMuxerLocked()
+            }
+          }
+          if (!muxerStarted) break
+        }
+        outIndex >= 0 -> {
+          drainedAny = true
+          val encodedData = codec.getOutputBuffer(outIndex)
+          val flags = reusableAudioBufferInfo.flags
+          val isConfigBuffer = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+          val isEos = (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
 
-    // Fallback: if audio encoder hasn't produced a format after 800ms, start muxer with video-only
-    if (
-      !muxerStarted &&
-        videoTrackIndex >= 0 &&
-        activeAudioPipeline &&
-        (SystemClock.elapsedRealtime() - engineStartRealtimeMs) > 800L
-    ) {
-      activeAudioPipeline = false
-      audioEosReceived = true
-      maybeStartMuxer()
-    }
+          if (
+            !isConfigBuffer &&
+              reusableAudioBufferInfo.size > 0 &&
+              encodedData != null &&
+              muxerStarted &&
+              audioTrackIndex >= 0
+          ) {
+            encodedData.position(reusableAudioBufferInfo.offset)
+            encodedData.limit(reusableAudioBufferInfo.offset + reusableAudioBufferInfo.size)
+            synchronized(muxerLock) {
+              if (muxerStarted) {
+                mediaMuxer?.writeSampleData(audioTrackIndex, encodedData, reusableAudioBufferInfo)
+                audioSamplesWritten++
+              }
+            }
+          }
 
-    // 3. Once muxer has started, drain all available encoded samples from both tracks
-    if (muxerStarted) {
-      if (vCodec != null && !videoEosReceived) {
-        drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = false)
+          codec.releaseOutputBuffer(outIndex, false)
+
+          if (isEos) {
+            audioEosReceived = true
+            break
+          }
+        }
       }
-      if (activeAudioPipeline && aCodec != null && !audioEosReceived) {
-        drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = false)
-      }
     }
+    return drainedAny
   }
 
   private fun queueAudioEndOfStream() {
@@ -868,7 +1087,9 @@ class ScreenRecordingEngine(
     while (SystemClock.elapsedRealtime() < deadline) {
       val inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
       if (inIndex >= 0) {
-        val ptsUs = (totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE
+        val baseUs =
+          if (audioStartBasePtsUs >= 0L) audioStartBasePtsUs else (System.nanoTime() / 1_000L)
+        val ptsUs = baseUs + ((totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE)
         codec.queueInputBuffer(
           inIndex,
           0,
@@ -878,8 +1099,7 @@ class ScreenRecordingEngine(
         )
         return
       }
-      // Drain output buffer in case encoder queue is full
-      drainSingleCodecPass(codec = codec, isVideo = false, waitForMuxerStart = !muxerStarted)
+      drainAudioCodecStep(codec)
     }
   }
 
@@ -887,35 +1107,31 @@ class ScreenRecordingEngine(
     val vCodec = videoEncoder
     val aCodec = audioEncoder
 
-    // Ensure formats are registered so muxer starts before draining remaining EOS samples
-    val formatDeadline = SystemClock.elapsedRealtime() + 1_000L
+    val formatDeadline = SystemClock.elapsedRealtime() + 500L
     while (!muxerStarted && SystemClock.elapsedRealtime() < formatDeadline) {
       if (vCodec != null && videoTrackIndex < 0) {
-        drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = true)
+        drainVideoCodecStep(vCodec)
       }
       if (activeAudioPipeline && aCodec != null && audioTrackIndex < 0) {
-        drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = true)
+        drainAudioCodecStep(aCodec)
       }
       if (muxerStarted) break
-      Thread.sleep(10L)
+      Thread.sleep(5L)
     }
 
-    // If video track format is ready but audio format never arrived, start muxer with video track
-    if (!muxerStarted && videoTrackIndex >= 0) {
-      activeAudioPipeline = false
-      audioEosReceived = true
-      maybeStartMuxer()
+    synchronized(muxerLock) {
+      if (!muxerStarted && videoTrackIndex >= 0) {
+        activeAudioPipeline = false
+        audioEosReceived = true
+        maybeStartMuxerLocked()
+      }
     }
 
     // Drain video encoder until BUFFER_FLAG_END_OF_STREAM (3-second timeout)
     if (vCodec != null) {
       val videoDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
       while (!videoEosReceived && SystemClock.elapsedRealtime() < videoDeadline) {
-        val drainedAny =
-          drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = false)
-        if (!drainedAny && !videoEosReceived) {
-          Thread.sleep(10L)
-        }
+        drainVideoCodecStep(vCodec)
       }
     }
 
@@ -923,114 +1139,12 @@ class ScreenRecordingEngine(
     if (activeAudioPipeline && aCodec != null) {
       val audioDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
       while (!audioEosReceived && SystemClock.elapsedRealtime() < audioDeadline) {
-        val drainedAny =
-          drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = false)
-        if (!drainedAny && !audioEosReceived) {
-          Thread.sleep(10L)
-        }
+        drainAudioCodecStep(aCodec)
       }
     }
   }
 
-  /**
-   * Drains output buffers from [codec].
-   * When [waitForMuxerStart] is true and the track format is already registered, stops before
-   * consuming sample buffers so the initial keyframe is preserved until [mediaMuxer] starts.
-   */
-  private fun drainSingleCodecPass(
-    codec: MediaCodec,
-    isVideo: Boolean,
-    waitForMuxerStart: Boolean,
-  ): Boolean {
-    if (waitForMuxerStart) {
-      if (isVideo && videoTrackIndex >= 0) return false
-      if (!isVideo && audioTrackIndex >= 0) return false
-    }
-
-    val bufferInfo = if (isVideo) reusableVideoBufferInfo else reusableAudioBufferInfo
-    var processedAny = false
-
-    while (true) {
-      val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
-      when {
-        outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-          processedAny = true
-          val muxer = mediaMuxer
-          if (muxer != null && !muxerStarted) {
-            if (isVideo && videoTrackIndex < 0) {
-              videoTrackIndex = muxer.addTrack(codec.outputFormat)
-              maybeStartMuxer()
-            } else if (!isVideo && audioTrackIndex < 0) {
-              audioTrackIndex = muxer.addTrack(codec.outputFormat)
-              maybeStartMuxer()
-            }
-          }
-          if (waitForMuxerStart && !muxerStarted) {
-            break
-          }
-        }
-        outIndex >= 0 -> {
-          processedAny = true
-          val encodedData = codec.getOutputBuffer(outIndex)
-          val isConfigBuffer = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
-          val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-
-          // Never write BUFFER_FLAG_CODEC_CONFIG buffers to the muxer
-          if (!isConfigBuffer && bufferInfo.size > 0 && encodedData != null && muxerStarted) {
-            if (isVideo && videoTrackIndex >= 0) {
-              val rawAdjustedUs = bufferInfo.presentationTimeUs - totalPausedDurationUs
-              if (videoBaseRawPtsUs < 0L) {
-                videoBaseRawPtsUs = rawAdjustedUs
-              }
-              var normalizedPtsUs = (rawAdjustedUs - videoBaseRawPtsUs).coerceAtLeast(0L)
-              if (lastVideoMuxedPtsUs >= 0L && normalizedPtsUs <= lastVideoMuxedPtsUs) {
-                // Ensure strictly monotonically increasing presentation timestamps
-                normalizedPtsUs = lastVideoMuxedPtsUs + 1_000L
-              }
-              lastVideoMuxedPtsUs = normalizedPtsUs
-              bufferInfo.presentationTimeUs = normalizedPtsUs
-
-              encodedData.position(bufferInfo.offset)
-              encodedData.limit(bufferInfo.offset + bufferInfo.size)
-              mediaMuxer?.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
-              videoSamplesWritten++
-            } else if (!isVideo && audioTrackIndex >= 0) {
-              val rawPtsUs = bufferInfo.presentationTimeUs
-              if (audioBaseRawPtsUs < 0L) {
-                audioBaseRawPtsUs = rawPtsUs
-              }
-              var normalizedPtsUs = (rawPtsUs - audioBaseRawPtsUs).coerceAtLeast(0L)
-              if (lastAudioMuxedPtsUs >= 0L && normalizedPtsUs <= lastAudioMuxedPtsUs) {
-                normalizedPtsUs = lastAudioMuxedPtsUs + 500L
-              }
-              lastAudioMuxedPtsUs = normalizedPtsUs
-              bufferInfo.presentationTimeUs = normalizedPtsUs
-
-              encodedData.position(bufferInfo.offset)
-              encodedData.limit(bufferInfo.offset + bufferInfo.size)
-              mediaMuxer?.writeSampleData(audioTrackIndex, encodedData, bufferInfo)
-              audioSamplesWritten++
-            }
-          }
-
-          codec.releaseOutputBuffer(outIndex, false)
-
-          if (isEos) {
-            if (isVideo) {
-              videoEosReceived = true
-            } else {
-              audioEosReceived = true
-            }
-            break
-          }
-        }
-      }
-    }
-    return processedAny
-  }
-
-  private fun maybeStartMuxer() {
+  private fun maybeStartMuxerLocked() {
     if (muxerStarted) return
     val videoReady = videoTrackIndex >= 0
     val audioReady = !activeAudioPipeline || audioTrackIndex >= 0
@@ -1099,11 +1213,15 @@ class ScreenRecordingEngine(
     isStopping.set(true)
 
     try {
-      drainHandler?.removeCallbacksAndMessages(null)
-      drainThread?.quitSafely()
+      videoDrainThread?.join(500L)
     } catch (_: Throwable) {} finally {
-      drainHandler = null
-      drainThread = null
+      videoDrainThread = null
+    }
+
+    try {
+      audioFeederThread?.join(500L)
+    } catch (_: Throwable) {} finally {
+      audioFeederThread = null
     }
 
     try {
@@ -1114,8 +1232,11 @@ class ScreenRecordingEngine(
 
     stopAndReleaseEncodersAndAudioRecord()
 
-    val muxer = mediaMuxer
-    mediaMuxer = null
+    val muxer: MediaMuxer?
+    synchronized(muxerLock) {
+      muxer = mediaMuxer
+      mediaMuxer = null
+    }
     if (muxer != null) {
       try {
         if (muxerStarted) muxer.stop()
@@ -1140,13 +1261,18 @@ class ScreenRecordingEngine(
     pendingOutputUri = null
   }
 
-  private fun roundEven(value: Int): Int {
-    val clamped = max(2, value)
-    return if (clamped % 2 == 0) clamped else clamped - 1
+  private fun roundDown16(value: Int): Int {
+    val clamped = max(16, value)
+    return (clamped / 16) * 16
   }
 
-  private fun alignTo(value: Int, alignment: Int): Int {
+  private fun alignDown(value: Int, alignment: Int): Int {
     if (alignment <= 1) return value
-    return (value / alignment) * alignment
+    return max(alignment, (value / alignment) * alignment)
+  }
+
+  private fun alignUpTo16(alignment: Int): Int {
+    if (alignment <= 16) return 16
+    return ((alignment + 15) / 16) * 16
   }
 }

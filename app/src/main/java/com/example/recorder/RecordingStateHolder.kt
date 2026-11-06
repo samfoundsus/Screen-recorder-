@@ -1,6 +1,5 @@
 package com.example.recorder
 
-import android.net.Uri
 import com.example.domain.model.RecorderState
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -9,20 +8,6 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-
-data class SavedRecordingMetadata(
-  val contentUri: Uri,
-  val displayName: String,
-  val durationMs: Long,
-  val sizeBytes: Long,
-  val resolution: String,
-  val fps: Int,
-  val bitrateMbps: Int,
-  val codec: String,
-  val container: String,
-  val hasMicAudio: Boolean,
-  val audioChannelMode: String,
-)
 
 sealed interface RecordingEngineStatus {
   data object Idle : RecordingEngineStatus
@@ -60,14 +45,6 @@ object RecordingStateHolder {
     )
   val startRequests: SharedFlow<Unit> = _startRequests.asSharedFlow()
 
-  private val _savedRecordings =
-    MutableSharedFlow<SavedRecordingMetadata>(
-      replay = 0,
-      extraBufferCapacity = 4,
-      onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-  val savedRecordings: SharedFlow<SavedRecordingMetadata> = _savedRecordings.asSharedFlow()
-
   fun requestStart() {
     _startRequests.tryEmit(Unit)
   }
@@ -92,6 +69,10 @@ object RecordingStateHolder {
     _elapsedTimeMs.value = elapsedMs
   }
 
+  fun showSnackbarMessage(message: String) {
+    _errorMessage.value = message
+  }
+
   fun reportError(message: String) {
     _engineStatus.value = RecordingEngineStatus.Error(message)
     _recorderState.value = RecorderState.IDLE
@@ -101,9 +82,5 @@ object RecordingStateHolder {
 
   fun consumeErrorMessage() {
     _errorMessage.value = null
-  }
-
-  fun publishSavedRecording(metadata: SavedRecordingMetadata) {
-    _savedRecordings.tryEmit(metadata)
   }
 }

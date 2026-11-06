@@ -43,24 +43,29 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
+import com.example.data.repository.RecordingMediaCache
 import com.example.domain.model.RecorderState
 import com.example.domain.model.RecordingItem
 import com.example.ui.components.FormatUtils
@@ -184,12 +189,17 @@ fun HomeScreen(
         val recentList = uiState.recentRecordings
         if (recentList.isEmpty()) {
           item(key = "empty_recent") {
-            Text(
-              text = "No recordings yet",
-              style = MaterialTheme.typography.bodyMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-              modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
-            )
+            Box(
+              modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 32.dp),
+              contentAlignment = Alignment.Center,
+            ) {
+              Text(
+                text = "No recordings yet",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+              )
+            }
           }
         } else {
           items(
@@ -468,9 +478,27 @@ private fun FlatRecentRecordingRow(
   item: RecordingItem,
   onClick: () -> Unit,
 ) {
-  val shortResolution = item.resolution.substringBefore(" ").trim()
+  val context = LocalContext.current
+  var metadata by remember(item.contentUri) {
+    mutableStateOf(RecordingMediaCache.getCachedMetadata(item.contentUri))
+  }
+
+  LaunchedEffect(item.contentUri) {
+    if (metadata == null && item.contentUri.isNotBlank()) {
+      metadata = RecordingMediaCache.loadMetadata(context, item.contentUri)
+    }
+  }
+
+  val resolvedResolution = metadata?.resolution ?: item.resolution
+  val shortResolution = resolvedResolution.substringBefore(" ").trim()
+  val resolvedFps = metadata?.fps ?: item.fps
+
   val summaryText =
-    "$shortResolution · ${item.fps} fps · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    if (resolvedFps != null && resolvedFps > 0) {
+      "$shortResolution · $resolvedFps fps · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    } else {
+      "$shortResolution · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    }
 
   Row(
     modifier =

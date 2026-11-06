@@ -51,19 +51,24 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.data.repository.RecordingMediaCache
 import com.example.domain.model.DateFilter
 import com.example.domain.model.RecordingCategory
 import com.example.domain.model.RecordingItem
@@ -305,11 +310,13 @@ fun LibraryScreen(
         val items = uiState.filteredRecordings
         if (items.isEmpty()) {
           item(key = "empty_state") {
-            LibraryMinimalEmptyState(
-              hasActiveFilters =
-                uiState.searchQuery.isNotBlank() ||
+            val hasActiveFilters =
+              uiState.totalRecordingsCount > 0 &&
+                (uiState.searchQuery.isNotBlank() ||
                   uiState.selectedCategory != RecordingCategory.ALL ||
-                  uiState.selectedDateFilter != DateFilter.ALL_TIME,
+                  uiState.selectedDateFilter != DateFilter.ALL_TIME)
+            LibraryMinimalEmptyState(
+              hasActiveFilters = hasActiveFilters,
               onResetFilters = onClearFilters,
             )
           }
@@ -400,9 +407,27 @@ private fun FlatLibraryRecordingRow(
   onClick: () -> Unit,
   onLongClick: () -> Unit,
 ) {
-  val shortResolution = item.resolution.substringBefore(" ").trim()
+  val context = LocalContext.current
+  var metadata by remember(item.contentUri) {
+    mutableStateOf(RecordingMediaCache.getCachedMetadata(item.contentUri))
+  }
+
+  LaunchedEffect(item.contentUri) {
+    if (metadata == null && item.contentUri.isNotBlank()) {
+      metadata = RecordingMediaCache.loadMetadata(context, item.contentUri)
+    }
+  }
+
+  val resolvedResolution = metadata?.resolution ?: item.resolution
+  val shortResolution = resolvedResolution.substringBefore(" ").trim()
+  val resolvedFps = metadata?.fps ?: item.fps
+
   val summaryText =
-    "$shortResolution · ${item.fps} fps · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    if (resolvedFps != null && resolvedFps > 0) {
+      "$shortResolution · $resolvedFps fps · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    } else {
+      "$shortResolution · ${FormatUtils.formatFileSize(item.sizeBytes)} · ${FormatUtils.formatRelativeDate(item.createdAtEpochMs)}"
+    }
 
   val rowBackground =
     if (isSelected) {
@@ -571,23 +596,20 @@ private fun LibraryMinimalEmptyState(
     modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 48.dp),
     horizontalAlignment = Alignment.CenterHorizontally,
   ) {
-    Text(
-      text = if (hasActiveFilters) "No matching recordings" else "No recordings yet",
-      style = MaterialTheme.typography.titleMedium,
-      color = MaterialTheme.colorScheme.onSurface,
-    )
-    Spacer(modifier = Modifier.height(6.dp))
-    Text(
-      text =
-        if (hasActiveFilters) {
-          "Try adjusting your search or filter settings."
-        } else {
-          "Recordings you capture will appear here."
-        },
-      style = MaterialTheme.typography.bodyMedium,
-      color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-    if (hasActiveFilters) {
+    if (!hasActiveFilters) {
+      Text(
+        text = "No recordings yet",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+      )
+    } else {
+      Text(
+        text = "No matching recordings",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        textAlign = TextAlign.Center,
+      )
       Spacer(modifier = Modifier.height(12.dp))
       TextButton(
         onClick = onResetFilters,

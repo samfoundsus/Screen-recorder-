@@ -256,26 +256,18 @@ class RecorderService : Service() {
     timerJob?.cancel()
     timerJob = null
 
-    val finalElapsedMs =
-      if (isPausedState) {
-        activeTimeMs
-      } else {
-        activeTimeMs + (SystemClock.elapsedRealtime() - lastResumeRealtimeMs).coerceAtLeast(0L)
-      }
-
     val engine = recordingEngine
     recordingEngine = null
 
     serviceScope.launch {
       try {
         // Steps a-f run sequentially inside stopAndFinalize on this background thread
-        val savedMetadata = engine?.stopAndFinalize(finalElapsedMs)
+        val finalizedUri = engine?.stopAndFinalize()
 
-        // Step g: Publish the finalized Uri to the library and playback screens ONLY after step f completes
-        if (savedMetadata != null) {
-          RecordingStateHolder.publishSavedRecording(savedMetadata)
+        // Step g: Recording finalized in MediaStore (IS_PENDING = 0); ContentObserver refreshes library/Home
+        if (finalizedUri != null) {
           ScreenRecordingEngine.debugLog(
-            "Step g (Publish finalized Uri) succeeded: uri=${savedMetadata.contentUri}, size=${savedMetadata.sizeBytes} bytes"
+            "Step g (Finalized Uri ready for MediaStore ContentObserver) succeeded: uri=$finalizedUri"
           )
         } else {
           ScreenRecordingEngine.debugLog(

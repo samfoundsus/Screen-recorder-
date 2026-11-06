@@ -4,7 +4,6 @@ import android.net.Uri
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -74,7 +73,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
-import com.example.R
+import com.example.data.repository.RecordingMediaCache
 import com.example.ui.components.FormatUtils
 import com.example.ui.theme.JetBrainsMonoFamily
 import kotlinx.coroutines.delay
@@ -94,12 +93,23 @@ fun PlaybackScreen(
   val lifecycleOwner = LocalLifecycleOwner.current
   val recording = uiState.recording
 
+  var metadata by remember(recording?.contentUri) {
+    mutableStateOf(recording?.contentUri?.let { RecordingMediaCache.getCachedMetadata(it) })
+  }
+
+  LaunchedEffect(recording?.contentUri) {
+    val uriStr = recording?.contentUri ?: return@LaunchedEffect
+    if (uriStr.isNotBlank()) {
+      metadata = RecordingMediaCache.loadMetadata(context, uriStr)
+    }
+  }
+
   var isPlaying by remember { mutableStateOf(false) }
   var isMuted by remember { mutableStateOf(false) }
   var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
   var currentPositionMs by remember { mutableLongStateOf(0L) }
-  var durationMs by remember {
-    mutableLongStateOf((recording?.durationMs ?: 5_000L).coerceAtLeast(1_000L))
+  var durationMs by remember(recording?.durationMs) {
+    mutableLongStateOf((recording?.durationMs ?: 1_000L).coerceAtLeast(1_000L))
   }
   var showDeleteDialog by remember { mutableStateOf(false) }
 
@@ -107,13 +117,13 @@ fun PlaybackScreen(
   val exoPlayer =
     remember(context, recording?.contentUri) {
       ExoPlayer.Builder(context).build().apply {
-        val mediaUri =
-          recording?.contentUri?.let { Uri.parse(it) }
-            ?: Uri.parse("android.resource://${context.packageName}/${R.raw.sample_recording}")
-        setMediaItem(MediaItem.fromUri(mediaUri))
-        repeatMode = Player.REPEAT_MODE_ONE
-        prepare()
-        playWhenReady = true
+        val uriStr = recording?.contentUri
+        if (!uriStr.isNullOrBlank()) {
+          setMediaItem(MediaItem.fromUri(Uri.parse(uriStr)))
+          repeatMode = Player.REPEAT_MODE_ONE
+          prepare()
+          playWhenReady = true
+        }
       }
     }
 
@@ -396,6 +406,11 @@ fun PlaybackScreen(
 
         // Recording Details Grouped Card
         if (recording != null) {
+          val resolvedResolution = metadata?.resolution ?: recording.resolution
+          val resolvedFps = metadata?.fps ?: recording.fps
+          val resolvedBitrateMbps = metadata?.bitrateMbps ?: recording.bitrateMbps
+          val resolvedCodec = metadata?.codec ?: recording.codec
+
           Surface(
             shape = RoundedCornerShape(24.dp),
             color = MaterialTheme.colorScheme.surfaceContainer,
@@ -410,17 +425,19 @@ fun PlaybackScreen(
                 style = MaterialTheme.typography.titleSmall,
                 color = MaterialTheme.colorScheme.primary,
               )
-              MetadataDetailRow("Resolution & Frame rate", "${recording.resolution} • ${recording.fps} FPS")
-              MetadataDetailRow("Codec & Container", "${recording.codec} • ${recording.container}")
-              MetadataDetailRow("Target Bitrate", "${recording.bitrateMbps} Mbps")
               MetadataDetailRow(
-                "Audio track",
-                if (recording.hasMicAudio) {
-                  "Device audio + Mic (${recording.audioChannelMode})"
-                } else {
-                  "Device audio only (${recording.audioChannelMode})"
-                },
+                label = if (resolvedFps != null && resolvedFps > 0) "Resolution & Frame rate" else "Resolution",
+                value =
+                  if (resolvedFps != null && resolvedFps > 0) {
+                    "$resolvedResolution • $resolvedFps FPS"
+                  } else {
+                    resolvedResolution
+                  },
               )
+              MetadataDetailRow("Codec & Container", "$resolvedCodec • ${recording.container}")
+              if (resolvedBitrateMbps != null && resolvedBitrateMbps > 0) {
+                MetadataDetailRow("Bitrate", "$resolvedBitrateMbps Mbps")
+              }
               MetadataDetailRow(
                 "File size & Recorded",
                 "${FormatUtils.formatFileSize(recording.sizeBytes)} • ${FormatUtils.formatRelativeDate(recording.createdAtEpochMs)}",

@@ -30,6 +30,15 @@ enum class DateFilter(val label: String) {
   LAST_30_DAYS("Last 30 days"),
 }
 
+data class VideoMetadata(
+  val width: Int?,
+  val height: Int?,
+  val resolution: String?,
+  val fps: Int?,
+  val bitrateMbps: Int?,
+  val codec: String,
+)
+
 data class RecordingItem(
   val id: String,
   val title: String,
@@ -37,15 +46,15 @@ data class RecordingItem(
   val durationMs: Long,
   val sizeBytes: Long,
   val resolution: String,
-  val fps: Int,
-  val bitrateMbps: Int,
+  val fps: Int?,
+  val bitrateMbps: Int?,
   val codec: String,
   val container: String,
   val hasMicAudio: Boolean,
   val audioChannelMode: String,
   val category: RecordingCategory,
   val accentHue: Float,
-  val contentUri: String? = null,
+  val contentUri: String,
 )
 
 data class DeviceCapabilities(
