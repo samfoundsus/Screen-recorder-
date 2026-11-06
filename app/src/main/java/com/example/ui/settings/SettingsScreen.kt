@@ -12,11 +12,13 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LargeTopAppBar
 import androidx.compose.material3.MaterialTheme
@@ -29,6 +31,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -48,6 +51,7 @@ import com.example.R
 import com.example.domain.model.AppThemeMode
 import com.example.domain.model.MainDestination
 import com.example.domain.model.NavDestinationConfig
+import com.example.domain.model.OptionProbeState
 import com.example.ui.components.pixelGroupedItemShape
 import kotlin.math.roundToInt
 
@@ -73,6 +77,9 @@ private enum class ActiveSettingsDialog {
 @Composable
 fun SettingsScreen(
   uiState: SettingsUiState,
+  onOpenResolutionPicker: () -> Unit,
+  onOpenFpsPicker: () -> Unit,
+  onRetestDeviceSupport: () -> Unit,
   onUpdateResolution: (String) -> Unit,
   onUpdateFps: (Int) -> Unit,
   onUpdateBitrate: (Int) -> Unit,
@@ -138,8 +145,11 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Resolution",
             summary = video.resolution,
-            shape = pixelGroupedItemShape(index = 0, totalCount = 6),
-            onClick = { activeDialog = ActiveSettingsDialog.VIDEO_RESOLUTION },
+            shape = pixelGroupedItemShape(index = 0, totalCount = 7),
+            onClick = {
+              onOpenResolutionPicker()
+              activeDialog = ActiveSettingsDialog.VIDEO_RESOLUTION
+            },
             testTag = "settings_video_resolution",
           )
         }
@@ -147,16 +157,24 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Frame rate",
             summary = "${video.fps} FPS",
-            shape = pixelGroupedItemShape(index = 1, totalCount = 6),
-            onClick = { activeDialog = ActiveSettingsDialog.VIDEO_FPS },
+            shape = pixelGroupedItemShape(index = 1, totalCount = 7),
+            onClick = {
+              onOpenFpsPicker()
+              activeDialog = ActiveSettingsDialog.VIDEO_FPS
+            },
             testTag = "settings_video_fps",
           )
         }
         item(key = "video_bitrate") {
           PixelSettingsRow(
             title = "Bitrate",
-            summary = "${video.bitrateMbps} Mbps target stream rate",
-            shape = pixelGroupedItemShape(index = 2, totalCount = 6),
+            summary =
+              if (video.isCustomBitrate) {
+                "${video.bitrateMbps} Mbps (custom)"
+              } else {
+                "${video.bitrateMbps} Mbps (auto-scaled)"
+              },
+            shape = pixelGroupedItemShape(index = 2, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_BITRATE },
             testTag = "settings_video_bitrate",
           )
@@ -165,7 +183,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Codec",
             summary = video.codec,
-            shape = pixelGroupedItemShape(index = 3, totalCount = 6),
+            shape = pixelGroupedItemShape(index = 3, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CODEC },
             testTag = "settings_video_codec",
           )
@@ -174,7 +192,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Container",
             summary = video.container,
-            shape = pixelGroupedItemShape(index = 4, totalCount = 6),
+            shape = pixelGroupedItemShape(index = 4, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CONTAINER },
             testTag = "settings_video_container",
           )
@@ -183,9 +201,18 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Orientation",
             summary = video.orientation,
-            shape = pixelGroupedItemShape(index = 5, totalCount = 6),
+            shape = pixelGroupedItemShape(index = 5, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_ORIENTATION },
             testTag = "settings_video_orientation",
+          )
+        }
+        item(key = "video_retest_support") {
+          PixelSettingsRow(
+            title = "Re-test device support",
+            summary = "Clear cached encoder probe results and test again",
+            shape = pixelGroupedItemShape(index = 6, totalCount = 7),
+            onClick = onRetestDeviceSupport,
+            testTag = "settings_video_retest_support",
           )
         }
 
@@ -335,7 +362,8 @@ fun SettingsScreen(
           )
         }
         item(key = "appearance_theme") {
-          val dynamicSummary = if (appearance.dynamicColor) "Material You dynamic color" else "Standard palette"
+          val dynamicSummary =
+            if (appearance.dynamicColor) "Material You dynamic color" else "Standard palette"
           PixelSettingsRow(
             title = "Theme",
             summary = "${appearance.themeMode.label} ($dynamicSummary)",
@@ -403,10 +431,13 @@ fun SettingsScreen(
   when (activeDialog) {
     ActiveSettingsDialog.NONE -> Unit
     ActiveSettingsDialog.VIDEO_RESOLUTION -> {
-      SingleChoiceSettingsDialog(
-        title = "Resolution",
+      LaunchedEffect(Unit) {
+        onOpenResolutionPicker()
+      }
+      ProbedResolutionSettingsDialog(
         options = capabilities.supportedResolutions,
         selectedOption = video.resolution,
+        probeStates = uiState.resolutionProbeStates,
         onSelect = {
           onUpdateResolution(it)
           activeDialog = ActiveSettingsDialog.NONE
@@ -415,13 +446,16 @@ fun SettingsScreen(
       )
     }
     ActiveSettingsDialog.VIDEO_FPS -> {
-      SingleChoiceSettingsDialog(
-        title = "Frame rate",
-        options = capabilities.supportedFps.map { "$it FPS" },
-        selectedOption = "${video.fps} FPS",
-        onSelect = { label ->
-          val parsed = label.substringBefore(" ").toIntOrNull() ?: 60
-          onUpdateFps(parsed)
+      LaunchedEffect(Unit) {
+        onOpenFpsPicker()
+      }
+      ProbedFpsSettingsDialog(
+        options = capabilities.supportedFps,
+        selectedFps = video.fps,
+        probeStates = uiState.fpsProbeStates,
+        displayRefreshRateHz = uiState.displayRefreshRateHz,
+        onSelect = { fps ->
+          onUpdateFps(fps)
           activeDialog = ActiveSettingsDialog.NONE
         },
         onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
@@ -596,10 +630,6 @@ private fun PixelSectionHeader(text: String) {
   )
 }
 
-/**
- * Pixel Settings-style row with a title and a one-line summary only.
- * Explicitly contains NO icons, vectors, SVGs, or emojis.
- */
 @Composable
 private fun PixelSettingsRow(
   title: String,
@@ -639,10 +669,6 @@ private fun PixelSettingsRow(
   }
 }
 
-/**
- * Pixel Settings-style switch row with a title, one-line summary, and a standard M3 Switch.
- * Explicitly contains NO icons, vectors, SVGs, or emojis.
- */
 @Composable
 private fun PixelSettingsSwitchRow(
   title: String,
@@ -690,6 +716,192 @@ private fun PixelSettingsSwitchRow(
       )
     }
   }
+}
+
+@Composable
+private fun ProbedResolutionSettingsDialog(
+  options: List<String>,
+  selectedOption: String,
+  probeStates: Map<String, OptionProbeState>,
+  onSelect: (String) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text(text = "Resolution") },
+    text = {
+      Column {
+        options.forEach { option ->
+          val probeState = probeStates[option] ?: OptionProbeState.Probing
+          val isUnsupported = probeState is OptionProbeState.Unsupported
+          val isProbing =
+            probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val summaryText =
+            when (probeState) {
+              is OptionProbeState.Supported -> probeState.codecLabel
+              is OptionProbeState.Unsupported -> "Not supported on this device"
+              else -> null
+            }
+
+          Row(
+            modifier =
+              Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(enabled = !isUnsupported) { onSelect(option) }
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            RadioButton(
+              selected = option == selectedOption,
+              onClick = null,
+              enabled = !isUnsupported,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = option,
+                style = MaterialTheme.typography.bodyLarge,
+                color =
+                  if (isUnsupported) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                  } else {
+                    MaterialTheme.colorScheme.onSurface
+                  },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+              if (summaryText != null) {
+                Text(
+                  text = summaryText,
+                  style = MaterialTheme.typography.bodySmall,
+                  color =
+                    if (isUnsupported) {
+                      MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    } else {
+                      MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
+            if (isProbing) {
+              Spacer(modifier = Modifier.width(8.dp))
+              CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+              )
+            }
+          }
+        }
+      }
+    },
+    confirmButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Cancel")
+      }
+    },
+  )
+}
+
+@Composable
+private fun ProbedFpsSettingsDialog(
+  options: List<Int>,
+  selectedFps: Int,
+  probeStates: Map<Int, OptionProbeState>,
+  displayRefreshRateHz: Int,
+  onSelect: (Int) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text(text = "Frame rate") },
+    text = {
+      Column {
+        options.forEach { fps ->
+          val probeState = probeStates[fps] ?: OptionProbeState.Probing
+          val isUnsupported = probeState is OptionProbeState.Unsupported
+          val isProbing =
+            probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val summaryText =
+            when (probeState) {
+              is OptionProbeState.Supported -> probeState.codecLabel
+              is OptionProbeState.Unsupported -> "Not supported on this device"
+              else -> null
+            }
+
+          Row(
+            modifier =
+              Modifier.fillMaxWidth()
+                .clip(RoundedCornerShape(12.dp))
+                .clickable(enabled = !isUnsupported) { onSelect(fps) }
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            RadioButton(
+              selected = fps == selectedFps,
+              onClick = null,
+              enabled = !isUnsupported,
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "$fps fps",
+                style = MaterialTheme.typography.bodyLarge,
+                color =
+                  if (isUnsupported) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                  } else {
+                    MaterialTheme.colorScheme.onSurface
+                  },
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+              if (summaryText != null) {
+                Text(
+                  text = summaryText,
+                  style = MaterialTheme.typography.bodySmall,
+                  color =
+                    if (isUnsupported) {
+                      MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    } else {
+                      MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
+            if (isProbing) {
+              Spacer(modifier = Modifier.width(8.dp))
+              CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+              )
+            }
+          }
+        }
+
+        if (selectedFps > displayRefreshRateHz) {
+          Spacer(modifier = Modifier.height(10.dp))
+          Text(
+            text =
+              "Your screen is running at $displayRefreshRateHz Hz, so real frame rate may be lower.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp),
+          )
+        }
+      }
+    },
+    confirmButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Cancel")
+      }
+    },
+  )
 }
 
 @Composable

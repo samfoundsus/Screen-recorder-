@@ -166,6 +166,8 @@ fun ScreenRecorderApp(
             uiState = uiState,
             onPrimaryRecordAction = homeViewModel::onPrimaryRecordAction,
             onPauseResumeAction = homeViewModel::onPauseResumeAction,
+            onOpenResolutionPicker = homeViewModel::onOpenResolutionPicker,
+            onOpenFpsPicker = homeViewModel::onOpenFpsPicker,
             onSelectResolution = homeViewModel::selectResolution,
             onSelectFps = homeViewModel::selectFps,
             onToggleMic = homeViewModel::toggleMic,
@@ -229,6 +231,9 @@ fun ScreenRecorderApp(
 
           SettingsScreen(
             uiState = uiState,
+            onOpenResolutionPicker = settingsViewModel::onOpenResolutionPicker,
+            onOpenFpsPicker = settingsViewModel::onOpenFpsPicker,
+            onRetestDeviceSupport = settingsViewModel::retestDeviceSupport,
             onUpdateResolution = settingsViewModel::updateResolution,
             onUpdateFps = settingsViewModel::updateFps,
             onUpdateBitrate = settingsViewModel::updateBitrate,

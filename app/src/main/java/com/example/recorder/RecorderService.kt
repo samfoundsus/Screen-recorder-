@@ -45,6 +45,7 @@ class RecorderService : Service() {
     private const val EXTRA_RESOLUTION = "extra_resolution"
     private const val EXTRA_FPS = "extra_fps"
     private const val EXTRA_BITRATE_MBPS = "extra_bitrate_mbps"
+    private const val EXTRA_CUSTOM_BITRATE = "extra_custom_bitrate"
     private const val EXTRA_CODEC = "extra_codec"
     private const val EXTRA_CONTAINER = "extra_container"
     private const val EXTRA_ORIENTATION = "extra_orientation"
@@ -69,6 +70,7 @@ class RecorderService : Service() {
         putExtra(EXTRA_RESOLUTION, settings.video.resolution)
         putExtra(EXTRA_FPS, settings.video.fps)
         putExtra(EXTRA_BITRATE_MBPS, settings.video.bitrateMbps)
+        putExtra(EXTRA_CUSTOM_BITRATE, settings.video.isCustomBitrate)
         putExtra(EXTRA_CODEC, settings.video.codec)
         putExtra(EXTRA_CONTAINER, settings.video.container)
         putExtra(EXTRA_ORIENTATION, settings.video.orientation)
@@ -125,9 +127,10 @@ class RecorderService : Service() {
 
     val sessionConfig =
       RecordingSessionConfig(
-        resolutionLabel = intent.getStringExtra(EXTRA_RESOLUTION) ?: "1080p (FHD)",
+        resolutionLabel = intent.getStringExtra(EXTRA_RESOLUTION) ?: "1080p",
         fps = intent.getIntExtra(EXTRA_FPS, 60),
-        bitrateMbps = intent.getIntExtra(EXTRA_BITRATE_MBPS, 16),
+        bitrateMbps = intent.getIntExtra(EXTRA_BITRATE_MBPS, 12),
+        isCustomBitrate = intent.getBooleanExtra(EXTRA_CUSTOM_BITRATE, false),
         codecLabel = intent.getStringExtra(EXTRA_CODEC) ?: "AVC (H.264)",
         containerLabel = intent.getStringExtra(EXTRA_CONTAINER) ?: "MP4",
         orientationLabel = intent.getStringExtra(EXTRA_ORIENTATION) ?: "Auto",
@@ -261,10 +264,7 @@ class RecorderService : Service() {
 
     serviceScope.launch {
       try {
-        // Steps a-f run sequentially inside stopAndFinalize on this background thread
         val finalizedUri = engine?.stopAndFinalize()
-
-        // Step g: Recording finalized in MediaStore (IS_PENDING = 0); ContentObserver refreshes library/Home
         if (finalizedUri != null) {
           ScreenRecordingEngine.debugLog(
             "Step g (Finalized Uri ready for MediaStore ContentObserver) succeeded: uri=$finalizedUri"
@@ -278,7 +278,6 @@ class RecorderService : Service() {
         ScreenRecordingEngine.debugLog("Step g exception during RecorderService stop: ${t.message}", t)
       } finally {
         RecordingStateHolder.setIdle()
-        // Keep foreground service alive until after step g has finished
         teardownProjectionAndForeground(stopProjection = !fromProjectionCallback)
         stopSelf()
       }

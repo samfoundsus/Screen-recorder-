@@ -1,7 +1,7 @@
 package com.example.data
 
 import android.content.Context
-import com.example.data.capabilities.FakeCapabilitiesProvider
+import com.example.data.capabilities.RealCapabilitiesProvider
 import com.example.data.repository.DataStoreSettingsRepository
 import com.example.data.repository.MediaStoreRecordingsRepository
 import com.example.domain.repository.CapabilitiesProvider
@@ -21,8 +21,9 @@ class AppContainer(
   private val appContext = context.applicationContext
   private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-  val capabilitiesProvider: CapabilitiesProvider = FakeCapabilitiesProvider()
   val settingsRepository: SettingsRepository = DataStoreSettingsRepository(appContext)
+  val capabilitiesProvider: CapabilitiesProvider =
+    RealCapabilitiesProvider(appContext, settingsRepository)
   val recordingsRepository: RecordingsRepository = MediaStoreRecordingsRepository(appContext)
   val recorderController: RecorderController = RealRecorderController(appContext)
 

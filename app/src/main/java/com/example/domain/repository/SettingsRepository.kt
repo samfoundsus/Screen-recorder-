@@ -20,5 +20,17 @@ interface SettingsRepository {
 
   suspend fun updateAppearanceSettings(transform: (AppearanceSettings) -> AppearanceSettings)
 
+  suspend fun getCachedProbeResult(codec: String, width: Int, height: Int, fps: Int): Boolean?
+
+  suspend fun saveCachedProbeResult(
+    codec: String,
+    width: Int,
+    height: Int,
+    fps: Int,
+    supported: Boolean,
+  )
+
+  suspend fun clearProbeCache()
+
   suspend fun resetToDefaults()
 }

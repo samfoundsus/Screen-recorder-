@@ -8,56 +8,115 @@ import com.example.domain.model.AppThemeMode
 import com.example.domain.model.DeviceCapabilities
 import com.example.domain.model.MainDestination
 import com.example.domain.model.NavDestinationConfig
+import com.example.domain.model.OptionProbeState
 import com.example.domain.repository.CapabilitiesProvider
 import com.example.domain.repository.SettingsRepository
+import com.example.recorder.RecordingStateHolder
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 data class SettingsUiState(
   val settings: AppSettings = AppSettings(),
   val capabilities: DeviceCapabilities,
+  val resolutionProbeStates: Map<String, OptionProbeState> = emptyMap(),
+  val fpsProbeStates: Map<Int, OptionProbeState> = emptyMap(),
+  val displayRefreshRateHz: Int = 60,
 )
 
 class SettingsViewModel(
   private val settingsRepository: SettingsRepository,
-  capabilitiesProvider: CapabilitiesProvider,
+  private val capabilitiesProvider: CapabilitiesProvider,
 ) : ViewModel() {
 
   private val capabilities = capabilitiesProvider.getCapabilities()
+  private val displayRefreshRateHz = capabilitiesProvider.getDisplayRefreshRateHz()
 
   val uiState: StateFlow<SettingsUiState> =
-    settingsRepository.settings
-      .map { appSettings ->
+    combine(
+        settingsRepository.settings,
+        capabilitiesProvider.resolutionProbeStates,
+        capabilitiesProvider.fpsProbeStates,
+      ) { appSettings, resProbes, fpsProbes ->
         SettingsUiState(
           settings = appSettings,
           capabilities = capabilities,
+          resolutionProbeStates = resProbes,
+          fpsProbeStates = fpsProbes,
+          displayRefreshRateHz = displayRefreshRateHz,
         )
       }
       .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = SettingsUiState(capabilities = capabilities),
+        initialValue =
+          SettingsUiState(
+            capabilities = capabilities,
+            displayRefreshRateHz = displayRefreshRateHz,
+          ),
       )
+
+  fun onOpenResolutionPicker() {
+    val video = uiState.value.settings.video
+    capabilitiesProvider.probeResolutionsForFps(video.fps, video.orientation)
+  }
+
+  fun onOpenFpsPicker() {
+    val video = uiState.value.settings.video
+    capabilitiesProvider.probeFpsForResolution(video.resolution, video.orientation)
+  }
+
+  fun retestDeviceSupport() {
+    viewModelScope.launch {
+      capabilitiesProvider.retestDeviceSupport()
+      RecordingStateHolder.showSnackbarMessage("Cleared cache and re-testing device support")
+    }
+  }
 
   // Video
   fun updateResolution(resolution: String) {
     viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(resolution = resolution) }
+      val probeState = uiState.value.resolutionProbeStates[resolution]
+      val matchedCodec =
+        if (probeState is OptionProbeState.Supported) {
+          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+        } else {
+          null
+        }
+      settingsRepository.updateVideoSettings {
+        it.copy(
+          resolution = resolution,
+          codec = matchedCodec ?: it.codec,
+        )
+      }
     }
   }
 
   fun updateFps(fps: Int) {
     viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(fps = fps) }
+      val probeState = uiState.value.fpsProbeStates[fps]
+      val matchedCodec =
+        if (probeState is OptionProbeState.Supported) {
+          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+        } else {
+          null
+        }
+      settingsRepository.updateVideoSettings {
+        it.copy(
+          fps = fps,
+          codec = matchedCodec ?: it.codec,
+        )
+      }
     }
   }
 
   fun updateBitrate(bitrateMbps: Int) {
     viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(bitrateMbps = bitrateMbps) }
+      settingsRepository.updateVideoSettings {
+        it.copy(bitrateMbps = bitrateMbps, isCustomBitrate = true)
+      }
     }
   }
 
@@ -184,7 +243,6 @@ class SettingsViewModel(
         val updated: List<NavDestinationConfig> =
           current.navOrder.map { item ->
             if (item.destination == destination) {
-              // Prevent disabling the last remaining enabled destination
               if (item.enabled && enabledCount <= 1) {
                 item
               } else {

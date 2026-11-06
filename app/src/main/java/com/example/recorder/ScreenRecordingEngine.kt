@@ -12,7 +12,6 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.media.MediaRecorder
@@ -30,6 +29,8 @@ import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
 import com.example.BuildConfig
+import com.example.data.capabilities.CapabilityProbe
+import com.example.data.repository.DataStoreSettingsRepository
 import com.example.data.repository.RecordingMediaCache
 import com.example.domain.model.VideoMetadata
 import java.nio.ByteBuffer
@@ -40,12 +41,14 @@ import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 
 data class RecordingSessionConfig(
   val resolutionLabel: String,
   val fps: Int,
   val bitrateMbps: Int,
+  val isCustomBitrate: Boolean,
   val codecLabel: String,
   val containerLabel: String,
   val orientationLabel: String,
@@ -77,7 +80,6 @@ class ScreenRecordingEngine(
 
   companion object {
     const val TAG = "ScreenRecorderEngine"
-    private const val VIDEO_MIME = MediaFormat.MIMETYPE_VIDEO_AVC
     private const val AUDIO_MIME = MediaFormat.MIMETYPE_AUDIO_AAC
     private const val AUDIO_SAMPLE_RATE = 44_100
     private const val AUDIO_CHANNEL_COUNT = 2
@@ -189,9 +191,10 @@ class ScreenRecordingEngine(
 
   private var actualWidth = 1072
   private var actualHeight = 1920
-  private var actualShortSide = 1080
   private var actualFps = 60
   private var actualBitrateBps = 12_000_000
+  private var actualVideoMime = MediaFormat.MIMETYPE_VIDEO_AVC
+  private var actualCodecLabel = "AVC (H.264)"
 
   fun start() {
     try {
@@ -218,7 +221,7 @@ class ScreenRecordingEngine(
       }
 
       debugLog(
-        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, bitrate=${actualBitrateBps / 1_000_000}Mbps, audio=$activeAudioPipeline, uri=$pendingOutputUri"
+        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, codec=$actualCodecLabel, bitrate=${actualBitrateBps / 1_000_000}Mbps, audio=$activeAudioPipeline, uri=$pendingOutputUri"
       )
     } catch (t: Throwable) {
       debugLog("Failed to start ScreenRecordingEngine: ${t.message}", t)
@@ -268,8 +271,6 @@ class ScreenRecordingEngine(
     }
     isRunning.set(false)
 
-    // Stop the background audio feeder and high-priority video drain loop so this background thread
-    // has exclusive, sequential ownership for steps a-f.
     try {
       audioFeederThread?.join(1_000L)
     } catch (_: Throwable) {}
@@ -381,8 +382,8 @@ class ScreenRecordingEngine(
             height = actualHeight,
             resolution = RecordingMediaCache.formatResolutionLabel(actualWidth, actualHeight),
             fps = actualFps,
-            bitrateMbps = (actualBitrateBps / 1_000_000).coerceAtLeast(1),
-            codec = "AVC (H.264)",
+            bitrateMbps = ((actualBitrateBps + 500_000) / 1_000_000).coerceAtLeast(1),
+            codec = actualCodecLabel,
           ),
         )
         val values =
@@ -461,167 +462,36 @@ class ScreenRecordingEngine(
     val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     val metrics = DisplayMetrics()
     @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(metrics)
-    val screenW = metrics.widthPixels.coerceAtLeast(360)
-    val screenH = metrics.heightPixels.coerceAtLeast(640)
     val densityDpi = metrics.densityDpi.coerceAtLeast(160)
 
-    val wantLandscape =
-      when (config.orientationLabel) {
-        "Landscape" -> true
-        "Portrait" -> false
-        else -> screenW > screenH
+    val settingsRepository = DataStoreSettingsRepository(context.applicationContext)
+    val resolvedSpec =
+      runBlocking(Dispatchers.IO) {
+        CapabilityProbe.resolveSupportedEncoderSpec(
+          context = context.applicationContext,
+          settingsRepository = settingsRepository,
+          requestedResolution = config.resolutionLabel,
+          requestedFps = config.fps,
+          orientationLabel = config.orientationLabel,
+          customBitrateMbps = config.bitrateMbps.takeIf { config.isCustomBitrate },
+          notifyAndPersistOnFallback = true,
+        )
       }
 
-    val requestedShortSide =
-      when {
-        config.resolutionLabel.startsWith("1440") -> 1440
-        config.resolutionLabel.startsWith("1080") -> 1080
-        config.resolutionLabel.startsWith("720") -> 720
-        config.resolutionLabel.startsWith("480") -> 480
-        else -> min(screenW, screenH)
-      }
-    val requestedFps = config.fps.coerceIn(15, 120)
-    val aspect = max(screenW, screenH).toDouble() / min(screenW, screenH).toDouble()
-
-    // Select H.264 hardware encoder
-    val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-    val avcEncoders =
-      codecList.codecInfos.filter { info ->
-        info.isEncoder && info.supportedTypes.any { it.equals(VIDEO_MIME, ignoreCase = true) }
-      }
-    val avcEncoderInfo =
-      avcEncoders.firstOrNull { info ->
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-          info.isHardwareAccelerated
-        } else {
-          !info.name.startsWith("OMX.google.", ignoreCase = true) &&
-            !info.name.startsWith("c2.android.", ignoreCase = true)
-        }
-      } ?: avcEncoders.firstOrNull()
-
-    val codecCaps: MediaCodecInfo.CodecCapabilities? =
-      try {
-        avcEncoderInfo?.getCapabilitiesForType(VIDEO_MIME)
-      } catch (_: Throwable) {
-        null
-      }
-    val videoCaps: MediaCodecInfo.VideoCapabilities? = codecCaps?.videoCapabilities
-
-    // Round down width and height to multiples of 16 before configuring the encoder
-    fun compute16AlignedDimensions(shortSideTarget: Int): Pair<Int, Int> {
-      val rawShort = roundDown16(shortSideTarget)
-      val rawLong = roundDown16((shortSideTarget * aspect).roundToInt())
-      val desiredW = if (wantLandscape) rawLong else rawShort
-      val desiredH = if (wantLandscape) rawShort else rawLong
-      if (videoCaps == null) return desiredW to desiredH
-
-      val wAlign = max(16, alignUpTo16(videoCaps.widthAlignment))
-      val hAlign = max(16, alignUpTo16(videoCaps.heightAlignment))
-
-      val supportedWidths = videoCaps.supportedWidths
-      val clampedW =
-        alignDown(
-          desiredW.coerceIn(supportedWidths.lower, supportedWidths.upper),
-          wAlign,
-        ).coerceIn(supportedWidths.lower, supportedWidths.upper)
-
-      val supportedHeights =
-        try {
-          videoCaps.getSupportedHeightsFor(clampedW)
-        } catch (_: Throwable) {
-          videoCaps.supportedHeights
-        }
-      val clampedH =
-        alignDown(
-          desiredH.coerceIn(supportedHeights.lower, supportedHeights.upper),
-          hAlign,
-        ).coerceIn(supportedHeights.lower, supportedHeights.upper)
-      return roundDown16(clampedW) to roundDown16(clampedH)
-    }
-
-    fun selectSupportedFpsForSize(width: Int, height: Int, targetFps: Int): Int? {
-      if (videoCaps == null) return targetFps
-      if (!videoCaps.isSizeSupported(width, height)) return null
-      val fpsRange =
-        try {
-          videoCaps.getSupportedFrameRatesFor(width, height)
-        } catch (_: Throwable) {
-          return null
-        }
-      val upperFps = fpsRange.upper.toInt()
-      val lowerFps = fpsRange.lower.roundToInt().coerceAtLeast(15)
-      if (upperFps < 15) return null
-      if (targetFps in lowerFps..upperFps) return targetFps
-
-      val standardRates = listOf(120, 90, 60, 30, 24)
-      val nearestStandard =
-        standardRates.firstOrNull { it <= targetFps && it in lowerFps..upperFps }
-      return nearestStandard ?: targetFps.coerceIn(lowerFps, upperFps)
-    }
-
-    if (videoCaps != null) {
-      val (candW, candH) = compute16AlignedDimensions(requestedShortSide)
-      val candShortSide = min(candW, candH)
-      val candFps = selectSupportedFpsForSize(candW, candH, requestedFps)
-
-      // If 1440p at requested fps is not supported, drop to nearest supported frame rate first, then to 1080p
-      if (requestedShortSide >= 1440 && (candShortSide < 1300 || candFps == null || candFps < 24)) {
-        val (w1080, h1080) = compute16AlignedDimensions(1080)
-        val fps1080 =
-          selectSupportedFpsForSize(w1080, h1080, requestedFps)
-            ?: selectSupportedFpsForSize(w1080, h1080, 60)
-            ?: 30
-        actualWidth = w1080
-        actualHeight = h1080
-        actualFps = fps1080
-      } else if (candFps != null) {
-        actualWidth = candW
-        actualHeight = candH
-        actualFps = candFps
-      } else {
-        val fallbackShort = if (requestedShortSide > 720) 720 else 480
-        val (fbW, fbH) = compute16AlignedDimensions(fallbackShort)
-        val fbFps = selectSupportedFpsForSize(fbW, fbH, min(requestedFps, 60)) ?: 30
-        actualWidth = fbW
-        actualHeight = fbH
-        actualFps = fbFps
-      }
-    } else {
-      val (w, h) = compute16AlignedDimensions(requestedShortSide)
-      actualWidth = w
-      actualHeight = h
-      actualFps = requestedFps
-    }
-
-    // Ensure final width and height are strictly multiples of 16 (round down)
-    actualWidth = roundDown16(actualWidth)
-    actualHeight = roundDown16(actualHeight)
-
-    actualShortSide =
-      when {
-        min(actualWidth, actualHeight) >= 1300 -> 1440
-        min(actualWidth, actualHeight) >= 1000 -> 1080
-        min(actualWidth, actualHeight) >= 640 -> 720
-        else -> 480
-      }
-
-    // Cap default bitrate at 12 Mbps for 1080p and 20 Mbps for 1440p, and never exceed getBitrateRange().upper
-    val maxBitrateMbpsForTier = if (actualShortSide >= 1440) 20 else 12
-    val requestedMbps = config.bitrateMbps.coerceAtLeast(1)
-    val cappedBitrateBps = min(requestedMbps, maxBitrateMbpsForTier) * 1_000_000
-    actualBitrateBps =
-      if (videoCaps != null) {
-        val bitrateRange = videoCaps.bitrateRange
-        cappedBitrateBps.coerceIn(bitrateRange.lower, bitrateRange.upper)
-      } else {
-        cappedBitrateBps
-      }
+    // Width and height are strictly multiples of 16 (rounded down)
+    actualWidth = CapabilityProbe.roundDown16(resolvedSpec.width)
+    actualHeight = CapabilityProbe.roundDown16(resolvedSpec.height)
+    actualFps = resolvedSpec.fps
+    actualBitrateBps = resolvedSpec.bitrateBps
+    actualVideoMime = resolvedSpec.mimeType
+    actualCodecLabel = if (resolvedSpec.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
 
     fun createEncoderInstance(): MediaCodec {
-      return if (avcEncoderInfo != null) {
-        MediaCodec.createByCodecName(avcEncoderInfo.name)
+      val name = resolvedSpec.encoderName
+      return if (!name.isNullOrBlank()) {
+        MediaCodec.createByCodecName(name)
       } else {
-        MediaCodec.createEncoderByType(VIDEO_MIME)
+        MediaCodec.createEncoderByType(actualVideoMime)
       }
     }
 
@@ -647,7 +517,7 @@ class ScreenRecordingEngine(
     videoEncoder = encoder
     videoInputSurface = inputSurface
 
-    // Create VirtualDisplay at the same 16-aligned size with VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR and encoder input Surface only
+    // Create VirtualDisplay at the exact same 16-aligned size
     virtualDisplay =
       mediaProjection.createVirtualDisplay(
         "PixelScreenRecorderDisplay",
@@ -662,12 +532,12 @@ class ScreenRecordingEngine(
   }
 
   /**
-   * Uses only: MIME video/avc, width, height, KEY_COLOR_FORMAT = COLOR_FormatSurface,
+   * Uses only: MIME (video/avc or video/hevc), width, height, KEY_COLOR_FORMAT = COLOR_FormatSurface,
    * KEY_BIT_RATE, KEY_FRAME_RATE, and KEY_I_FRAME_INTERVAL = 1.
    * Leaves KEY_BITRATE_MODE unset (device default).
    */
   private fun buildPrimaryVideoFormat(): MediaFormat {
-    return MediaFormat.createVideoFormat(VIDEO_MIME, actualWidth, actualHeight).apply {
+    return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
       setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
         MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
@@ -682,7 +552,7 @@ class ScreenRecordingEngine(
    * Fallback format that drops KEY_BITRATE_MODE and KEY_I_FRAME_INTERVAL.
    */
   private fun buildFallbackVideoFormat(): MediaFormat {
-    return MediaFormat.createVideoFormat(VIDEO_MIME, actualWidth, actualHeight).apply {
+    return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
       setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
         MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
@@ -980,7 +850,10 @@ class ScreenRecordingEngine(
                 if (!outFormat.containsKey(MediaFormat.KEY_FRAME_RATE)) {
                   outFormat.setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !outFormat.containsKey(MediaFormat.KEY_CAPTURE_RATE)) {
+                if (
+                  Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                    !outFormat.containsKey(MediaFormat.KEY_CAPTURE_RATE)
+                ) {
                   outFormat.setInteger(MediaFormat.KEY_CAPTURE_RATE, actualFps)
                 }
               } catch (_: Throwable) {}
@@ -997,7 +870,13 @@ class ScreenRecordingEngine(
           val isConfigBuffer = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
           val isEos = (flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
 
-          if (!isConfigBuffer && reusableVideoBufferInfo.size > 0 && encodedData != null && muxerStarted && videoTrackIndex >= 0) {
+          if (
+            !isConfigBuffer &&
+              reusableVideoBufferInfo.size > 0 &&
+              encodedData != null &&
+              muxerStarted &&
+              videoTrackIndex >= 0
+          ) {
             val pausedOffsetUs = totalPausedDurationUs
             if (pausedOffsetUs > 0L) {
               reusableVideoBufferInfo.presentationTimeUs -= pausedOffsetUs
@@ -1127,7 +1006,6 @@ class ScreenRecordingEngine(
       }
     }
 
-    // Drain video encoder until BUFFER_FLAG_END_OF_STREAM (3-second timeout)
     if (vCodec != null) {
       val videoDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
       while (!videoEosReceived && SystemClock.elapsedRealtime() < videoDeadline) {
@@ -1135,7 +1013,6 @@ class ScreenRecordingEngine(
       }
     }
 
-    // Drain audio encoder until BUFFER_FLAG_END_OF_STREAM (3-second timeout)
     if (activeAudioPipeline && aCodec != null) {
       val audioDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
       while (!audioEosReceived && SystemClock.elapsedRealtime() < audioDeadline) {
@@ -1253,26 +1130,12 @@ class ScreenRecordingEngine(
       parcelFileDescriptor = null
     }
 
-    pendingOutputUri?.let { uri ->
+    val uri = pendingOutputUri
+    pendingOutputUri = null
+    if (uri != null) {
       try {
         context.contentResolver.delete(uri, null, null)
       } catch (_: Throwable) {}
     }
-    pendingOutputUri = null
-  }
-
-  private fun roundDown16(value: Int): Int {
-    val clamped = max(16, value)
-    return (clamped / 16) * 16
-  }
-
-  private fun alignDown(value: Int, alignment: Int): Int {
-    if (alignment <= 1) return value
-    return max(alignment, (value / alignment) * alignment)
-  }
-
-  private fun alignUpTo16(alignment: Int): Int {
-    if (alignment <= 16) return 16
-    return ((alignment + 15) / 16) * 16
   }
 }

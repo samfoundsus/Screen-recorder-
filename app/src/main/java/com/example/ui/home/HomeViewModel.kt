@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.domain.model.AppSettings
 import com.example.domain.model.DeviceCapabilities
+import com.example.domain.model.OptionProbeState
 import com.example.domain.model.RecorderState
 import com.example.domain.model.RecordingItem
 import com.example.domain.repository.CapabilitiesProvider
@@ -23,24 +24,34 @@ data class HomeUiState(
   val settings: AppSettings = AppSettings(),
   val recentRecordings: List<RecordingItem> = emptyList(),
   val capabilities: DeviceCapabilities,
+  val resolutionProbeStates: Map<String, OptionProbeState> = emptyMap(),
+  val fpsProbeStates: Map<Int, OptionProbeState> = emptyMap(),
+  val displayRefreshRateHz: Int = 60,
 )
 
 class HomeViewModel(
   private val recorderController: RecorderController,
   private val settingsRepository: SettingsRepository,
   private val recordingsRepository: RecordingsRepository,
-  capabilitiesProvider: CapabilitiesProvider,
+  private val capabilitiesProvider: CapabilitiesProvider,
 ) : ViewModel() {
 
   private val capabilities = capabilitiesProvider.getCapabilities()
+  private val displayRefreshRateHz = capabilitiesProvider.getDisplayRefreshRateHz()
 
   val uiState: StateFlow<HomeUiState> =
     combine(
-        recorderController.state,
-        recorderController.elapsedTimeMs,
-        settingsRepository.settings,
-        recordingsRepository.recordings,
-      ) { recState, elapsed, appSettings, allRecordings ->
+        combine(
+          recorderController.state,
+          recorderController.elapsedTimeMs,
+          settingsRepository.settings,
+          recordingsRepository.recordings,
+        ) { recState, elapsed, appSettings, allRecordings ->
+          Quad(recState, elapsed, appSettings, allRecordings)
+        },
+        capabilitiesProvider.resolutionProbeStates,
+        capabilitiesProvider.fpsProbeStates,
+      ) { (recState, elapsed, appSettings, allRecordings), resProbes, fpsProbes ->
         HomeUiState(
           recorderState = recState,
           elapsedTimeMs = elapsed,
@@ -48,12 +59,19 @@ class HomeViewModel(
           recentRecordings =
             allRecordings.sortedByDescending { it.createdAtEpochMs }.take(4),
           capabilities = capabilities,
+          resolutionProbeStates = resProbes,
+          fpsProbeStates = fpsProbes,
+          displayRefreshRateHz = displayRefreshRateHz,
         )
       }
       .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = HomeUiState(capabilities = capabilities),
+        initialValue =
+          HomeUiState(
+            capabilities = capabilities,
+            displayRefreshRateHz = displayRefreshRateHz,
+          ),
       )
 
   fun onPrimaryRecordAction() {
@@ -72,15 +90,49 @@ class HomeViewModel(
     }
   }
 
+  fun onOpenResolutionPicker() {
+    val video = uiState.value.settings.video
+    capabilitiesProvider.probeResolutionsForFps(video.fps, video.orientation)
+  }
+
+  fun onOpenFpsPicker() {
+    val video = uiState.value.settings.video
+    capabilitiesProvider.probeFpsForResolution(video.resolution, video.orientation)
+  }
+
   fun selectResolution(resolution: String) {
     viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(resolution = resolution) }
+      val probeState = uiState.value.resolutionProbeStates[resolution]
+      val matchedCodec =
+        if (probeState is OptionProbeState.Supported) {
+          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+        } else {
+          null
+        }
+      settingsRepository.updateVideoSettings {
+        it.copy(
+          resolution = resolution,
+          codec = matchedCodec ?: it.codec,
+        )
+      }
     }
   }
 
   fun selectFps(fps: Int) {
     viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(fps = fps) }
+      val probeState = uiState.value.fpsProbeStates[fps]
+      val matchedCodec =
+        if (probeState is OptionProbeState.Supported) {
+          if (probeState.codecLabel == "HEVC") "HEVC (H.265)" else "AVC (H.264)"
+        } else {
+          null
+        }
+      settingsRepository.updateVideoSettings {
+        it.copy(
+          fps = fps,
+          codec = matchedCodec ?: it.codec,
+        )
+      }
     }
   }
 
@@ -100,6 +152,8 @@ class HomeViewModel(
       }
     }
   }
+
+  private data class Quad<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
   companion object {
     fun provideFactory(

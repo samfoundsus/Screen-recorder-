@@ -30,6 +30,21 @@ enum class DateFilter(val label: String) {
   LAST_30_DAYS("Last 30 days"),
 }
 
+sealed interface OptionProbeState {
+  data object Idle : OptionProbeState
+
+  data object Probing : OptionProbeState
+
+  data class Supported(
+    val codecLabel: String,
+    val mimeType: String,
+    val width: Int,
+    val height: Int,
+  ) : OptionProbeState
+
+  data object Unsupported : OptionProbeState
+}
+
 data class VideoMetadata(
   val width: Int?,
   val height: Int?,

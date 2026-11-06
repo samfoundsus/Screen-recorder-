@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
@@ -66,6 +67,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.data.repository.RecordingMediaCache
+import com.example.domain.model.OptionProbeState
 import com.example.domain.model.RecorderState
 import com.example.domain.model.RecordingItem
 import com.example.ui.components.FormatUtils
@@ -77,6 +79,8 @@ fun HomeScreen(
   uiState: HomeUiState,
   onPrimaryRecordAction: () -> Unit,
   onPauseResumeAction: () -> Unit,
+  onOpenResolutionPicker: () -> Unit,
+  onOpenFpsPicker: () -> Unit,
   onSelectResolution: (String) -> Unit,
   onSelectFps: (Int) -> Unit,
   onToggleMic: () -> Unit,
@@ -152,8 +156,14 @@ fun HomeScreen(
             resolution = uiState.settings.video.resolution,
             fps = uiState.settings.video.fps,
             micEnabled = uiState.settings.audio.micEnabled,
-            onResolutionClick = { showResolutionDialog = true },
-            onFpsClick = { showFpsDialog = true },
+            onResolutionClick = {
+              onOpenResolutionPicker()
+              showResolutionDialog = true
+            },
+            onFpsClick = {
+              onOpenFpsPicker()
+              showFpsDialog = true
+            },
             onMicToggle = onToggleMic,
           )
           Spacer(modifier = Modifier.height(44.dp))
@@ -218,9 +228,13 @@ fun HomeScreen(
   }
 
   if (showResolutionDialog) {
+    LaunchedEffect(Unit) {
+      onOpenResolutionPicker()
+    }
     ResolutionPickerDialog(
       options = uiState.capabilities.supportedResolutions,
       selected = uiState.settings.video.resolution,
+      probeStates = uiState.resolutionProbeStates,
       onSelect = {
         onSelectResolution(it)
         showResolutionDialog = false
@@ -230,9 +244,14 @@ fun HomeScreen(
   }
 
   if (showFpsDialog) {
+    LaunchedEffect(Unit) {
+      onOpenFpsPicker()
+    }
     FpsPickerDialog(
       options = uiState.capabilities.supportedFps,
       selected = uiState.settings.video.fps,
+      probeStates = uiState.fpsProbeStates,
+      displayRefreshRateHz = uiState.displayRefreshRateHz,
       onSelect = {
         onSelectFps(it)
         showFpsDialog = false
@@ -275,7 +294,6 @@ private fun RecorderMinimalHero(
         .padding(top = 68.dp, bottom = 52.dp, start = 24.dp, end = 24.dp),
     horizontalAlignment = Alignment.CenterHorizontally,
   ) {
-    // Light-weight proportional system sans timer (00:00 format), always onSurface
     Text(
       text = FormatUtils.formatElapsedTimer(elapsedTimeMs),
       style =
@@ -320,7 +338,6 @@ private fun RecorderMinimalHero(
         }
       }
 
-      // 88dp button in primaryContainer with onPrimaryContainer inner glyph and M3 ripple
       Box(
         contentAlignment = Alignment.Center,
         modifier =
@@ -340,7 +357,6 @@ private fun RecorderMinimalHero(
             .testTag("home_record_button"),
       ) {
         if (recorderState == RecorderState.PAUSED) {
-          // Two-bar pause glyph in onPrimaryContainer
           Row(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -359,7 +375,6 @@ private fun RecorderMinimalHero(
             )
           }
         } else {
-          // Solid filled circle (idle, ~28% of 88dp = 25dp) morphing into rounded-square (recording)
           Box(
             modifier =
               Modifier.size(25.dp)
@@ -396,7 +411,6 @@ private fun QuickOptionsChipRow(
     horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
     verticalAlignment = Alignment.CenterVertically,
   ) {
-    // Resolution text-only tonal chip (minimum 48dp touch target)
     FilterChip(
       selected = false,
       onClick = onResolutionClick,
@@ -417,7 +431,6 @@ private fun QuickOptionsChipRow(
           .testTag("home_option_resolution"),
     )
 
-    // FPS text-only tonal chip (minimum 48dp touch target)
     FilterChip(
       selected = false,
       onClick = onFpsClick,
@@ -438,7 +451,6 @@ private fun QuickOptionsChipRow(
           .testTag("home_option_fps"),
     )
 
-    // Mic filter chip with checkmark when on (minimum 48dp touch target)
     FilterChip(
       selected = micEnabled,
       onClick = onMicToggle,
@@ -538,6 +550,7 @@ private fun FlatRecentRecordingRow(
 private fun ResolutionPickerDialog(
   options: List<String>,
   selected: String,
+  probeStates: Map<String, OptionProbeState>,
   onSelect: (String) -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -547,17 +560,61 @@ private fun ResolutionPickerDialog(
     text = {
       Column {
         options.forEach { option ->
+          val probeState = probeStates[option] ?: OptionProbeState.Probing
+          val isUnsupported = probeState is OptionProbeState.Unsupported
+          val isProbing = probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val summaryText =
+            when (probeState) {
+              is OptionProbeState.Supported -> probeState.codecLabel
+              is OptionProbeState.Unsupported -> "Not supported on this device"
+              else -> null
+            }
+
           Row(
             modifier =
               Modifier.fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
-                .clickable { onSelect(option) }
-                .padding(vertical = 10.dp, horizontal = 8.dp),
+                .clickable(enabled = !isUnsupported) { onSelect(option) }
+                .padding(vertical = 8.dp, horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
           ) {
-            RadioButton(selected = option == selected, onClick = null)
+            RadioButton(
+              selected = option == selected,
+              onClick = null,
+              enabled = !isUnsupported,
+            )
             Spacer(modifier = Modifier.width(12.dp))
-            Text(text = option, style = MaterialTheme.typography.bodyLarge)
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = option,
+                style = MaterialTheme.typography.bodyLarge,
+                color =
+                  if (isUnsupported) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                  } else {
+                    MaterialTheme.colorScheme.onSurface
+                  },
+              )
+              if (summaryText != null) {
+                Text(
+                  text = summaryText,
+                  style = MaterialTheme.typography.bodySmall,
+                  color =
+                    if (isUnsupported) {
+                      MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    } else {
+                      MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+              }
+            }
+            if (isProbing) {
+              Spacer(modifier = Modifier.width(8.dp))
+              CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+              )
+            }
           }
         }
       }
@@ -572,6 +629,8 @@ private fun ResolutionPickerDialog(
 private fun FpsPickerDialog(
   options: List<Int>,
   selected: Int,
+  probeStates: Map<Int, OptionProbeState>,
+  displayRefreshRateHz: Int,
   onSelect: (Int) -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -581,18 +640,75 @@ private fun FpsPickerDialog(
     text = {
       Column {
         options.forEach { fps ->
+          val probeState = probeStates[fps] ?: OptionProbeState.Probing
+          val isUnsupported = probeState is OptionProbeState.Unsupported
+          val isProbing = probeState is OptionProbeState.Probing || probeState is OptionProbeState.Idle
+          val summaryText =
+            when (probeState) {
+              is OptionProbeState.Supported -> probeState.codecLabel
+              is OptionProbeState.Unsupported -> "Not supported on this device"
+              else -> null
+            }
+
           Row(
             modifier =
               Modifier.fillMaxWidth()
                 .clip(RoundedCornerShape(12.dp))
-                .clickable { onSelect(fps) }
-                .padding(vertical = 10.dp, horizontal = 8.dp),
+                .clickable(enabled = !isUnsupported) { onSelect(fps) }
+                .padding(vertical = 8.dp, horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
           ) {
-            RadioButton(selected = fps == selected, onClick = null)
+            RadioButton(
+              selected = fps == selected,
+              onClick = null,
+              enabled = !isUnsupported,
+            )
             Spacer(modifier = Modifier.width(12.dp))
-            Text(text = "$fps fps", style = MaterialTheme.typography.bodyLarge)
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = "$fps fps",
+                style = MaterialTheme.typography.bodyLarge,
+                color =
+                  if (isUnsupported) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+                  } else {
+                    MaterialTheme.colorScheme.onSurface
+                  },
+              )
+              if (summaryText != null) {
+                Text(
+                  text = summaryText,
+                  style = MaterialTheme.typography.bodySmall,
+                  color =
+                    if (isUnsupported) {
+                      MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                    } else {
+                      MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                )
+              }
+            }
+            if (isProbing) {
+              Spacer(modifier = Modifier.width(8.dp))
+              CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+              )
+            }
           }
+        }
+
+        if (selected > displayRefreshRateHz) {
+          Spacer(modifier = Modifier.height(10.dp))
+          Text(
+            text =
+              "Your screen is running at $displayRefreshRateHz Hz, so real frame rate may be lower.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 8.dp),
+          )
         }
       }
     },

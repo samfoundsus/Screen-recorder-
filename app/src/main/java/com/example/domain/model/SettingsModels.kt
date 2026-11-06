@@ -22,9 +22,10 @@ data class NavDestinationConfig(
 )
 
 data class VideoSettings(
-  val resolution: String = "1080p (FHD)",
+  val resolution: String = "1080p",
   val fps: Int = 60,
   val bitrateMbps: Int = 12,
+  val isCustomBitrate: Boolean = false,
   val codec: String = "AVC (H.264)",
   val container: String = "MP4",
   val orientation: String = "Auto",
