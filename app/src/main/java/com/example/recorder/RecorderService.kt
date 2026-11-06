@@ -17,7 +17,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
@@ -36,8 +35,6 @@ import kotlinx.coroutines.launch
 class RecorderService : Service() {
 
   companion object {
-    private const val TAG = ScreenRecordingEngine.TAG
-
     const val ACTION_START = "com.example.recorder.action.START"
     const val ACTION_PAUSE = "com.example.recorder.action.PAUSE"
     const val ACTION_RESUME = "com.example.recorder.action.RESUME"
@@ -92,7 +89,7 @@ class RecorderService : Service() {
       Intent(context, RecorderService::class.java).apply { action = ACTION_STOP }
   }
 
-  private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+  private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
   private val mainHandler = Handler(Looper.getMainLooper())
   private val isStopping = AtomicBoolean(false)
 
@@ -182,7 +179,7 @@ class RecorderService : Service() {
       val callback =
         object : MediaProjection.Callback() {
           override fun onStop() {
-            Log.i(TAG, "MediaProjection.Callback.onStop received from system")
+            ScreenRecordingEngine.debugLog("MediaProjection.Callback.onStop received from system")
             handleStop(fromProjectionCallback = true)
           }
         }
@@ -214,11 +211,11 @@ class RecorderService : Service() {
       startElapsedTicker()
       updateOngoingNotification()
     } catch (t: Throwable) {
-      Log.e(TAG, "Failed to start recording in RecorderService", t)
+      ScreenRecordingEngine.debugLog("Failed to start recording in RecorderService: ${t.message}", t)
       RecordingStateHolder.reportError(
         t.localizedMessage ?: "Unable to start screen recording."
       )
-      teardownServiceResources()
+      teardownServiceResourcesOnFailure()
       stopSelf()
     }
   }
@@ -250,6 +247,10 @@ class RecorderService : Service() {
     updateOngoingNotification()
   }
 
+  /**
+   * Executes steps a-g on the background thread BEFORE calling stopForeground or stopSelf,
+   * including when triggered from notification Stop or MediaProjection.Callback.onStop.
+   */
   private fun handleStop(fromProjectionCallback: Boolean) {
     if (isStopping.getAndSet(true)) return
     timerJob?.cancel()
@@ -267,14 +268,25 @@ class RecorderService : Service() {
 
     serviceScope.launch {
       try {
+        // Steps a-f run sequentially inside stopAndFinalize on this background thread
         val savedMetadata = engine?.stopAndFinalize(finalElapsedMs)
+
+        // Step g: Publish the finalized Uri to the library and playback screens ONLY after step f completes
         if (savedMetadata != null) {
           RecordingStateHolder.publishSavedRecording(savedMetadata)
+          ScreenRecordingEngine.debugLog(
+            "Step g (Publish finalized Uri) succeeded: uri=${savedMetadata.contentUri}, size=${savedMetadata.sizeBytes} bytes"
+          )
+        } else {
+          ScreenRecordingEngine.debugLog(
+            "Step g: No finalized recording published (recording was empty or failed)"
+          )
         }
       } catch (t: Throwable) {
-        Log.e(TAG, "Error during RecorderService stop", t)
+        ScreenRecordingEngine.debugLog("Step g exception during RecorderService stop: ${t.message}", t)
       } finally {
         RecordingStateHolder.setIdle()
+        // Keep foreground service alive until after step g has finished
         teardownProjectionAndForeground(stopProjection = !fromProjectionCallback)
         stopSelf()
       }
@@ -388,11 +400,11 @@ class RecorderService : Service() {
       .build()
   }
 
-  private fun teardownServiceResources() {
+  private fun teardownServiceResourcesOnFailure() {
     timerJob?.cancel()
     timerJob = null
     try {
-      recordingEngine?.cleanupAll(deletePendingUri = true)
+      recordingEngine?.cleanupAllOnFailure()
     } catch (_: Throwable) {} finally {
       recordingEngine = null
     }
@@ -423,7 +435,9 @@ class RecorderService : Service() {
 
   override fun onDestroy() {
     try {
-      teardownServiceResources()
+      if (!isStopping.get()) {
+        teardownServiceResourcesOnFailure()
+      }
     } finally {
       serviceScope.cancel()
       super.onDestroy()

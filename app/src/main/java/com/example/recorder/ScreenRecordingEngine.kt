@@ -1,6 +1,7 @@
 package com.example.recorder
 
 import android.annotation.SuppressLint
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.hardware.display.DisplayManager
@@ -22,19 +23,19 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Surface
 import android.view.WindowManager
+import com.example.BuildConfig
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.min
@@ -82,7 +83,64 @@ class ScreenRecordingEngine(
     private const val AUDIO_BITRATE = 128_000
     private const val PCM_FRAMES_PER_READ = 1024
     private const val DEQUEUE_TIMEOUT_US = 10_000L
+    private const val EOS_DRAIN_TIMEOUT_MS = 3_000L
     private const val PARAMETER_KEY_SUSPEND_VIDEO_INPUT = MediaCodec.PARAMETER_KEY_SUSPEND
+
+    fun debugLog(message: String, tr: Throwable? = null) {
+      if (BuildConfig.DEBUG) {
+        if (tr != null) {
+          Log.d(TAG, message, tr)
+        } else {
+          Log.d(TAG, message)
+        }
+      }
+    }
+
+    /**
+     * One-time startup cleanup that finds files in Movies/ScreenRecorder with IS_PENDING = 1
+     * older than 10 minutes and deletes them.
+     */
+    fun cleanupStalePendingRecordings(context: Context) {
+      try {
+        val resolver = context.contentResolver
+        val queryUri = MediaStore.setIncludePending(MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+        val tenMinutesAgoSec = (System.currentTimeMillis() / 1000L) - 600L
+
+        val projection =
+          arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.IS_PENDING,
+            MediaStore.Video.Media.DATE_ADDED,
+            MediaStore.Video.Media.RELATIVE_PATH,
+          )
+        val selection =
+          "${MediaStore.Video.Media.IS_PENDING} = 1 AND ${MediaStore.Video.Media.DATE_ADDED} < ?"
+        val selectionArgs = arrayOf(tenMinutesAgoSec.toString())
+
+        resolver.query(queryUri, projection, selection, selectionArgs, null)?.use { cursor ->
+          val idCol = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+          val pathCol = cursor.getColumnIndex(MediaStore.Video.Media.RELATIVE_PATH)
+          var deletedCount = 0
+          while (cursor.moveToNext()) {
+            val relPath = if (pathCol >= 0 && !cursor.isNull(pathCol)) cursor.getString(pathCol) else ""
+            if (relPath.isNullOrEmpty() || relPath.contains("ScreenRecorder", ignoreCase = true)) {
+              val id = cursor.getLong(idCol)
+              val itemUri =
+                ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+              try {
+                resolver.delete(itemUri, null, null)
+                deletedCount++
+              } catch (_: Throwable) {}
+            }
+          }
+          if (deletedCount > 0) {
+            debugLog("Cleaned up $deletedCount stale pending recording(s) older than 10 minutes")
+          }
+        }
+      } catch (t: Throwable) {
+        debugLog("Stale pending recordings cleanup error: ${t.message}", t)
+      }
+    }
   }
 
   private val isRunning = AtomicBoolean(false)
@@ -98,25 +156,39 @@ class ScreenRecordingEngine(
   private var parcelFileDescriptor: ParcelFileDescriptor? = null
   private var mediaMuxer: MediaMuxer? = null
 
-  private val muxerLock = Any()
+  private val drainLock = Any()
   @Volatile private var muxerStarted = false
   @Volatile private var videoTrackIndex = -1
   @Volatile private var audioTrackIndex = -1
   @Volatile private var activeAudioPipeline = false
+  @Volatile private var engineStartRealtimeMs = 0L
+
+  // Timestamp normalization and monotonic tracking (starting near 0 us per track)
+  private var videoBaseRawPtsUs: Long = -1L
+  private var lastVideoMuxedPtsUs: Long = -1L
+  private var videoSamplesWritten: Int = 0
+  private var videoEosReceived: Boolean = false
+
+  private var audioBaseRawPtsUs: Long = -1L
+  private var lastAudioMuxedPtsUs: Long = -1L
+  private var audioSamplesWritten: Int = 0
+  private var audioEosReceived: Boolean = false
+  @Volatile private var totalAudioFramesFed: Long = 0L
 
   private var videoEncoder: MediaCodec? = null
   private var videoInputSurface: Surface? = null
   private var virtualDisplay: VirtualDisplay? = null
-  private var videoDrainThread: HandlerThread? = null
-  private var videoDrainHandler: Handler? = null
-  private val videoDrainFinishedLatch = CountDownLatch(1)
+  private var drainThread: HandlerThread? = null
+  private var drainHandler: Handler? = null
 
   private var audioEncoder: MediaCodec? = null
   private var micAudioRecord: AudioRecord? = null
   private var micIsMono = false
   private var internalAudioRecord: AudioRecord? = null
-  private var audioThread: Thread? = null
-  private val audioDrainFinishedLatch = CountDownLatch(1)
+  private var audioFeederThread: Thread? = null
+
+  private val reusableVideoBufferInfo = MediaCodec.BufferInfo()
+  private val reusableAudioBufferInfo = MediaCodec.BufferInfo()
 
   private var actualWidth = 1080
   private var actualHeight = 1920
@@ -139,22 +211,20 @@ class ScreenRecordingEngine(
           false
         }
 
-      if (!activeAudioPipeline) {
-        audioDrainFinishedLatch.countDown()
-      }
-
+      engineStartRealtimeMs = SystemClock.elapsedRealtime()
       isRunning.set(true)
-      startVideoDrainLoop()
+
       if (activeAudioPipeline) {
-        startAudioCaptureAndEncodeLoop()
+        startAudioInputFeederThread()
       }
-      Log.i(
-        TAG,
-        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, audio=$activeAudioPipeline"
+      startPeriodicEncoderDrain()
+
+      debugLog(
+        "Recording started: ${actualWidth}x${actualHeight} @ ${actualFps}fps, audio=$activeAudioPipeline, uri=$pendingOutputUri"
       )
     } catch (t: Throwable) {
-      Log.e(TAG, "Failed to start ScreenRecordingEngine", t)
-      cleanupAll(deletePendingUri = true)
+      debugLog("Failed to start ScreenRecordingEngine: ${t.message}", t)
+      cleanupAllOnFailure()
       throw t
     }
   }
@@ -169,7 +239,7 @@ class ScreenRecordingEngine(
         }
       videoEncoder?.setParameters(params)
     } catch (t: Throwable) {
-      Log.w(TAG, "Failed to suspend video encoder input", t)
+      debugLog("Failed to suspend video encoder input: ${t.message}", t)
     }
   }
 
@@ -185,55 +255,168 @@ class ScreenRecordingEngine(
         }
       videoEncoder?.setParameters(params)
     } catch (t: Throwable) {
-      Log.w(TAG, "Failed to resume video encoder input", t)
+      debugLog("Failed to resume video encoder input: ${t.message}", t)
     }
   }
 
+  /**
+   * Ordered, sequential stop and finalize routine executed on the background thread (steps a-f).
+   * Step g (publishing to library/playback) is performed by the caller immediately after this returns.
+   */
   fun stopAndFinalize(recordedDurationMs: Long): SavedRecordingMetadata? {
-    if (!isRunning.getAndSet(false)) {
-      cleanupAll(deletePendingUri = true)
-      return null
-    }
+    if (isStopping.getAndSet(true)) return null
     if (isPaused.get()) {
       resume()
     }
-    isStopping.set(true)
+    isRunning.set(false)
 
-    return try {
+    // Stop the background audio feeder and periodic drain handler so this background thread
+    // has exclusive, sequential ownership of the encoders and muxer.
+    try {
+      audioFeederThread?.join(1_000L)
+    } catch (_: Throwable) {}
+    audioFeederThread = null
+
+    try {
+      drainHandler?.removeCallbacksAndMessages(null)
+      drainThread?.quitSafely()
+      drainThread?.join(1_000L)
+    } catch (_: Throwable) {}
+    drainHandler = null
+    drainThread = null
+
+    synchronized(drainLock) {
+      // STEP a: Stop feeding input: release VirtualDisplay, signal EOS on video and audio encoders
       try {
+        virtualDisplay?.release()
+        virtualDisplay = null
+
         videoEncoder?.signalEndOfInputStream()
-      } catch (t: Throwable) {
-        Log.w(TAG, "signalEndOfInputStream warning", t)
-      }
 
-      videoDrainFinishedLatch.await(3_000L, TimeUnit.MILLISECONDS)
-      audioDrainFinishedLatch.await(3_000L, TimeUnit.MILLISECONDS)
-
-      stopMuxerSafely()
-      val savedUri = finalizeMediaStoreUri()
-      if (savedUri != null) {
-        val fileSize = queryUriSize(savedUri)
-        SavedRecordingMetadata(
-          contentUri = savedUri,
-          displayName = outputDisplayName.removeSuffix(".mp4"),
-          durationMs = recordedDurationMs.coerceAtLeast(1_000L),
-          sizeBytes = fileSize.coerceAtLeast(1_024L),
-          resolution = "${min(actualWidth, actualHeight)}p (${actualWidth}×${actualHeight})",
-          fps = actualFps,
-          bitrateMbps = (actualBitrateBps / 1_000_000).coerceAtLeast(1),
-          codec = "AVC (H.264)",
-          container = "MP4",
-          hasMicAudio = config.wantsMicAudio && activeAudioPipeline,
-          audioChannelMode = config.audioChannelMode,
+        if (activeAudioPipeline) {
+          queueAudioEndOfStream()
+        }
+        debugLog(
+          "Step a (Stop feeding input & signal EOS) succeeded: virtualDisplay released, video/audio EOS signaled"
         )
-      } else {
-        null
+      } catch (t: Throwable) {
+        debugLog("Step a (Stop feeding input & signal EOS) exception: ${t.message}", t)
       }
-    } catch (t: Throwable) {
-      Log.e(TAG, "Error stopping and finalizing recording", t)
-      null
-    } finally {
-      cleanupAll(deletePendingUri = !muxerStarted)
+
+      // STEP b: Drain both encoders until each emits BUFFER_FLAG_END_OF_STREAM (3s timeout per encoder)
+      try {
+        drainEncodersUntilEosSequential()
+        debugLog(
+          "Step b (Drain encoders until EOS) succeeded: videoSamples=$videoSamplesWritten (eos=$videoEosReceived), audioSamples=$audioSamplesWritten (eos=$audioEosReceived)"
+        )
+      } catch (t: Throwable) {
+        debugLog("Step b (Drain encoders until EOS) exception: ${t.message}", t)
+      }
+
+      // STEP c: Stop and release the encoders and AudioRecord
+      try {
+        stopAndReleaseEncodersAndAudioRecord()
+        debugLog("Step c (Stop and release encoders and AudioRecord) succeeded")
+      } catch (t: Throwable) {
+        debugLog("Step c (Stop and release encoders and AudioRecord) exception: ${t.message}", t)
+      }
+
+      // STEP d: Call muxer.stop() inside try/catch, log exception if any, then muxer.release()
+      var muxerStoppedCleanly = false
+      val muxer = mediaMuxer
+      mediaMuxer = null
+      if (muxer != null) {
+        try {
+          if (muxerStarted && (videoSamplesWritten > 0 || audioSamplesWritten > 0)) {
+            muxer.stop()
+            muxerStoppedCleanly = true
+            debugLog("Step d (muxer.stop) succeeded")
+          } else {
+            debugLog(
+              "Step d (muxer.stop) skipped: muxerStarted=$muxerStarted, videoSamples=$videoSamplesWritten, audioSamples=$audioSamplesWritten"
+            )
+          }
+        } catch (t: Throwable) {
+          debugLog("Step d (muxer.stop) exception: ${t.message}", t)
+        } finally {
+          try {
+            muxer.release()
+            debugLog("Step d (muxer.release) succeeded")
+          } catch (t: Throwable) {
+            debugLog("Step d (muxer.release) exception: ${t.message}", t)
+          }
+          muxerStarted = false
+        }
+      }
+
+      // STEP e: Close the ParcelFileDescriptor
+      try {
+        parcelFileDescriptor?.let { pfd ->
+          try {
+            pfd.fileDescriptor?.sync()
+          } catch (_: Throwable) {}
+          pfd.close()
+        }
+        parcelFileDescriptor = null
+        debugLog("Step e (Close ParcelFileDescriptor) succeeded")
+      } catch (t: Throwable) {
+        parcelFileDescriptor = null
+        debugLog("Step e (Close ParcelFileDescriptor) exception: ${t.message}", t)
+      }
+
+      // STEP f: Only after closing ParcelFileDescriptor, update IS_PENDING = 0 (or delete if failed)
+      val uri = pendingOutputUri
+      pendingOutputUri = null
+      isCleanedUp.set(true)
+
+      if (uri == null) {
+        debugLog("Step f: No pending MediaStore Uri to finalize")
+        return null
+      }
+
+      if (muxerStoppedCleanly && videoSamplesWritten > 0) {
+        return try {
+          val values =
+            ContentValues().apply {
+              put(MediaStore.Video.Media.IS_PENDING, 0)
+            }
+          val updatedRows = context.contentResolver.update(uri, values, null, null)
+          val fileSize = queryUriSize(uri)
+          debugLog(
+            "Step f (Clear IS_PENDING=0) succeeded: rowsUpdated=$updatedRows, finalUri=$uri, fileSize=$fileSize bytes"
+          )
+
+          SavedRecordingMetadata(
+            contentUri = uri,
+            displayName = outputDisplayName.removeSuffix(".mp4"),
+            durationMs = recordedDurationMs.coerceAtLeast(1_000L),
+            sizeBytes = fileSize.coerceAtLeast(1_024L),
+            resolution = "${min(actualWidth, actualHeight)}p (${actualWidth}×${actualHeight})",
+            fps = actualFps,
+            bitrateMbps = (actualBitrateBps / 1_000_000).coerceAtLeast(1),
+            codec = "AVC (H.264)",
+            container = "MP4",
+            hasMicAudio = config.wantsMicAudio && activeAudioPipeline,
+            audioChannelMode = config.audioChannelMode,
+          )
+        } catch (t: Throwable) {
+          debugLog("Step f (Clear IS_PENDING=0) exception: ${t.message}", t)
+          try {
+            context.contentResolver.delete(uri, null, null)
+          } catch (_: Throwable) {}
+          null
+        }
+      } else {
+        try {
+          context.contentResolver.delete(uri, null, null)
+          debugLog(
+            "Step f: Deleted pending MediaStore row ($uri) because muxerStoppedCleanly=$muxerStoppedCleanly, videoSamples=$videoSamplesWritten"
+          )
+        } catch (t: Throwable) {
+          debugLog("Step f (Delete failed pending row) exception: ${t.message}", t)
+        }
+        return null
+      }
     }
   }
 
@@ -256,27 +439,7 @@ class ScreenRecordingEngine(
     pendingOutputUri = uri
     parcelFileDescriptor =
       resolver.openFileDescriptor(uri, "rw")
-        ?: throw IllegalStateException("Unable to open ParcelFileDescriptor for $uri")
-  }
-
-  private fun finalizeMediaStoreUri(): Uri? {
-    val uri = pendingOutputUri ?: return null
-    return try {
-      try {
-        parcelFileDescriptor?.close()
-      } catch (_: Throwable) {}
-      parcelFileDescriptor = null
-
-      val values =
-        ContentValues().apply {
-          put(MediaStore.Video.Media.IS_PENDING, 0)
-        }
-      context.contentResolver.update(uri, values, null, null)
-      uri
-    } catch (t: Throwable) {
-      Log.e(TAG, "Failed to clear IS_PENDING on MediaStore Uri", t)
-      null
-    }
+        ?: throw IllegalStateException("Unable to open ParcelFileDescriptor (rw) for $uri")
   }
 
   private fun queryUriSize(uri: Uri): Long {
@@ -396,6 +559,8 @@ class ScreenRecordingEngine(
         setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
         setInteger(MediaFormat.KEY_FRAME_RATE, actualFps)
         setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        // Repeat previous frame every 100ms when screen is static so surface encoder always emits frames
+        setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
       }
 
     val encoder =
@@ -472,7 +637,7 @@ class ScreenRecordingEngine(
             }
           }
         } catch (t: Throwable) {
-          Log.w(TAG, "Mic AudioRecord unavailable, continuing without mic", t)
+          debugLog("Mic AudioRecord unavailable, continuing without mic: ${t.message}")
         }
       }
 
@@ -505,7 +670,7 @@ class ScreenRecordingEngine(
             internalRec.release()
           }
         } catch (t: Throwable) {
-          Log.w(TAG, "AudioPlaybackCapture unavailable, continuing with silence/mic", t)
+          debugLog("AudioPlaybackCapture unavailable, continuing with silence/mic: ${t.message}")
         }
       }
 
@@ -525,70 +690,13 @@ class ScreenRecordingEngine(
       audioEncoder = encoder
       true
     } catch (t: Throwable) {
-      Log.w(TAG, "Audio pipeline initialization failed, falling back to video-only", t)
-      releaseAudioResources()
+      debugLog("Audio pipeline initialization failed, falling back to video-only: ${t.message}", t)
+      stopAndReleaseAudioOnly()
       false
     }
   }
 
-  private fun startVideoDrainLoop() {
-    val thread = HandlerThread("RecorderVideoDrain")
-    thread.start()
-    val handler = Handler(thread.looper)
-    videoDrainThread = thread
-    videoDrainHandler = handler
-
-    handler.post {
-      val bufferInfo = MediaCodec.BufferInfo()
-      var lastVideoPtsUs = 0L
-      try {
-        val codec = videoEncoder ?: return@post
-        var eosReached = false
-        while (!eosReached) {
-          val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
-          when {
-            outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-              if (!isRunning.get() && isStopping.get()) {
-                // Keep draining until EOS flag arrives
-              }
-            }
-            outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-              registerVideoTrackAndMaybeStartMuxer(codec.outputFormat)
-            }
-            outIndex >= 0 -> {
-              val encodedData = codec.getOutputBuffer(outIndex)
-              if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                bufferInfo.size = 0
-              }
-              if (bufferInfo.size > 0 && encodedData != null && isMuxerReadyForWrite()) {
-                val adjustedPts =
-                  (bufferInfo.presentationTimeUs - totalPausedDurationUs).coerceAtLeast(
-                    lastVideoPtsUs + 1L
-                  )
-                lastVideoPtsUs = adjustedPts
-                bufferInfo.presentationTimeUs = adjustedPts
-                encodedData.position(bufferInfo.offset)
-                encodedData.limit(bufferInfo.offset + bufferInfo.size)
-                synchronized(muxerLock) {
-                  if (muxerStarted && videoTrackIndex >= 0) {
-                    mediaMuxer?.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
-                  }
-                }
-              }
-              eosReached = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-              codec.releaseOutputBuffer(outIndex, false)
-            }
-          }
-        }
-      } catch (t: Throwable) {
-        Log.w(TAG, "Video drain loop terminated", t)
-      } finally {
-        videoDrainFinishedLatch.countDown()
-      }
-    }
-  }
-
-  private fun startAudioCaptureAndEncodeLoop() {
+  private fun startAudioInputFeederThread() {
     val thread =
       Thread(
         {
@@ -598,8 +706,6 @@ class ScreenRecordingEngine(
           val mixedPcm = ShortArray(stereoSamplesPerChunk)
           val directPcmBytes =
             ByteBuffer.allocateDirect(stereoSamplesPerChunk * 2).order(ByteOrder.nativeOrder())
-          val audioBufferInfo = MediaCodec.BufferInfo()
-          var totalFramesWritten = 0L
 
           try {
             try {
@@ -610,187 +716,332 @@ class ScreenRecordingEngine(
             } catch (_: Throwable) {}
 
             val codec = audioEncoder ?: return@Thread
-            var inputEosSent = false
-            var outputEosReached = false
 
-            while (!outputEosReached) {
-              if (isPaused.get() && isRunning.get()) {
+            while (isRunning.get() && !isStopping.get()) {
+              if (isPaused.get()) {
                 Thread.sleep(20L)
                 continue
               }
 
-              if (!inputEosSent) {
-                val running = isRunning.get()
-                val inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
-                if (inIndex >= 0) {
-                  val inputBuf = codec.getInputBuffer(inIndex)
-                  inputBuf?.clear()
-                  if (!running) {
-                    val ptsUs = (totalFramesWritten * 1_000_000L) / AUDIO_SAMPLE_RATE
-                    codec.queueInputBuffer(
-                      inIndex,
-                      0,
-                      0,
-                      ptsUs,
-                      MediaCodec.BUFFER_FLAG_END_OF_STREAM,
-                    )
-                    inputEosSent = true
+              val inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+              if (inIndex >= 0) {
+                val inputBuf = codec.getInputBuffer(inIndex)
+                inputBuf?.clear()
+
+                val micRec = micAudioRecord
+                var micSamplesRead = 0
+                if (micRec != null && micRec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                  if (micIsMono) {
+                    val monoRead = micRec.read(micPcm, 0, PCM_FRAMES_PER_READ)
+                    if (monoRead > 0) {
+                      for (i in monoRead - 1 downTo 0) {
+                        val s = micPcm[i]
+                        micPcm[i * 2] = s
+                        micPcm[i * 2 + 1] = s
+                      }
+                      micSamplesRead = monoRead * 2
+                    }
                   } else {
-                    val micRec = micAudioRecord
-                    var micSamplesRead = 0
-                    if (micRec != null && micRec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                      if (micIsMono) {
-                        val monoRead = micRec.read(micPcm, 0, PCM_FRAMES_PER_READ)
-                        if (monoRead > 0) {
-                          for (i in monoRead - 1 downTo 0) {
-                            val s = micPcm[i]
-                            micPcm[i * 2] = s
-                            micPcm[i * 2 + 1] = s
-                          }
-                          micSamplesRead = monoRead * 2
-                        }
-                      } else {
-                        val read = micRec.read(micPcm, 0, stereoSamplesPerChunk)
-                        if (read > 0) micSamplesRead = read
-                      }
-                    }
-
-                    val intRec = internalAudioRecord
-                    var intSamplesRead = 0
-                    if (intRec != null && intRec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                      val read = intRec.read(internalPcm, 0, stereoSamplesPerChunk)
-                      if (read > 0) intSamplesRead = read
-                    }
-
-                    val samplesToWrite =
-                      when {
-                        micSamplesRead > 0 && intSamplesRead > 0 ->
-                          min(micSamplesRead, intSamplesRead)
-                        micSamplesRead > 0 -> micSamplesRead
-                        intSamplesRead > 0 -> intSamplesRead
-                        else -> stereoSamplesPerChunk
-                      }
-
-                    for (i in 0 until samplesToWrite) {
-                      val a = if (i < micSamplesRead) micPcm[i].toInt() else 0
-                      val b = if (i < intSamplesRead) internalPcm[i].toInt() else 0
-                      val sum = (a + b).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                      mixedPcm[i] = sum.toShort()
-                    }
-
-                    directPcmBytes.clear()
-                    directPcmBytes.asShortBuffer().put(mixedPcm, 0, samplesToWrite)
-                    val byteCount = samplesToWrite * 2
-                    directPcmBytes.position(0)
-                    directPcmBytes.limit(byteCount)
-
-                    val capacity = inputBuf?.remaining() ?: 0
-                    val safeBytes = min(byteCount, capacity)
-                    directPcmBytes.limit(safeBytes)
-                    inputBuf?.put(directPcmBytes)
-
-                    val ptsUs = (totalFramesWritten * 1_000_000L) / AUDIO_SAMPLE_RATE
-                    val framesInChunk = (safeBytes / 2) / AUDIO_CHANNEL_COUNT
-                    totalFramesWritten += framesInChunk
-
-                    codec.queueInputBuffer(inIndex, 0, safeBytes, ptsUs, 0)
+                    val read = micRec.read(micPcm, 0, stereoSamplesPerChunk)
+                    if (read > 0) micSamplesRead = read
                   }
                 }
-              }
 
-              // Drain available audio output buffers
-              while (true) {
-                val outIndex = codec.dequeueOutputBuffer(audioBufferInfo, 2_000L)
-                when {
-                  outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                  outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    registerAudioTrackAndMaybeStartMuxer(codec.outputFormat)
-                  }
-                  outIndex >= 0 -> {
-                    val outBuf = codec.getOutputBuffer(outIndex)
-                    if ((audioBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                      audioBufferInfo.size = 0
-                    }
-                    if (audioBufferInfo.size > 0 && outBuf != null && isMuxerReadyForWrite()) {
-                      outBuf.position(audioBufferInfo.offset)
-                      outBuf.limit(audioBufferInfo.offset + audioBufferInfo.size)
-                      synchronized(muxerLock) {
-                        if (muxerStarted && audioTrackIndex >= 0) {
-                          mediaMuxer?.writeSampleData(audioTrackIndex, outBuf, audioBufferInfo)
-                        }
-                      }
-                    }
-                    if ((audioBufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                      outputEosReached = true
-                    }
-                    codec.releaseOutputBuffer(outIndex, false)
-                    if (outputEosReached) break
-                  }
+                val intRec = internalAudioRecord
+                var intSamplesRead = 0
+                if (intRec != null && intRec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                  val read = intRec.read(internalPcm, 0, stereoSamplesPerChunk)
+                  if (read > 0) intSamplesRead = read
                 }
+
+                val samplesToWrite =
+                  when {
+                    micSamplesRead > 0 && intSamplesRead > 0 -> min(micSamplesRead, intSamplesRead)
+                    micSamplesRead > 0 -> micSamplesRead
+                    intSamplesRead > 0 -> intSamplesRead
+                    else -> {
+                      // When generating silence, pace to real time (~23ms per 1024 frames)
+                      Thread.sleep(20L)
+                      stereoSamplesPerChunk
+                    }
+                  }
+
+                for (i in 0 until samplesToWrite) {
+                  val a = if (i < micSamplesRead) micPcm[i].toInt() else 0
+                  val b = if (i < intSamplesRead) internalPcm[i].toInt() else 0
+                  val sum = (a + b).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                  mixedPcm[i] = sum.toShort()
+                }
+
+                directPcmBytes.clear()
+                directPcmBytes.asShortBuffer().put(mixedPcm, 0, samplesToWrite)
+                val byteCount = samplesToWrite * 2
+                directPcmBytes.position(0)
+                directPcmBytes.limit(byteCount)
+
+                val capacity = inputBuf?.remaining() ?: 0
+                val safeBytes = min(byteCount, capacity)
+                directPcmBytes.limit(safeBytes)
+                inputBuf?.put(directPcmBytes)
+
+                val ptsUs = (totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE
+                val framesInChunk = (safeBytes / 2) / AUDIO_CHANNEL_COUNT
+                totalAudioFramesFed += framesInChunk
+
+                codec.queueInputBuffer(inIndex, 0, safeBytes, ptsUs, 0)
               }
             }
-          } catch (t: Throwable) {
-            Log.w(TAG, "Audio loop terminated", t)
-          } finally {
-            audioDrainFinishedLatch.countDown()
+          } catch (_: Throwable) {
+            // Exits cleanly when stopping
           }
         },
-        "RecorderAudioMixEncode",
+        "RecorderAudioFeeder",
       )
-    audioThread = thread
+    audioFeederThread = thread
     thread.start()
   }
 
-  private fun registerVideoTrackAndMaybeStartMuxer(format: MediaFormat) {
-    synchronized(muxerLock) {
-      if (muxerStarted || videoTrackIndex >= 0) return
-      val muxer = mediaMuxer ?: return
-      videoTrackIndex = muxer.addTrack(format)
-      maybeStartMuxerLocked()
+  private fun startPeriodicEncoderDrain() {
+    val thread = HandlerThread("RecorderVideoDrain")
+    thread.start()
+    val handler = Handler(thread.looper)
+    drainThread = thread
+    drainHandler = handler
+
+    val drainRunnable =
+      object : Runnable {
+        override fun run() {
+          if (!isRunning.get() || isStopping.get()) return
+          synchronized(drainLock) {
+            if (isRunning.get() && !isStopping.get()) {
+              drainAvailableOutputNonBlocking()
+            }
+          }
+          if (isRunning.get() && !isStopping.get()) {
+            handler.postDelayed(this, 10L)
+          }
+        }
+      }
+    handler.post(drainRunnable)
+  }
+
+  private fun drainAvailableOutputNonBlocking() {
+    val vCodec = videoEncoder
+    val aCodec = audioEncoder
+
+    // 1. If video format is not yet known, peek video encoder for INFO_OUTPUT_FORMAT_CHANGED
+    if (vCodec != null && videoTrackIndex < 0) {
+      drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = true)
+    }
+
+    // 2. If audio is active and audio format is not yet known, peek audio encoder for INFO_OUTPUT_FORMAT_CHANGED
+    if (activeAudioPipeline && aCodec != null && audioTrackIndex < 0) {
+      drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = true)
+    }
+
+    // Fallback: if audio encoder hasn't produced a format after 800ms, start muxer with video-only
+    if (
+      !muxerStarted &&
+        videoTrackIndex >= 0 &&
+        activeAudioPipeline &&
+        (SystemClock.elapsedRealtime() - engineStartRealtimeMs) > 800L
+    ) {
+      activeAudioPipeline = false
+      audioEosReceived = true
+      maybeStartMuxer()
+    }
+
+    // 3. Once muxer has started, drain all available encoded samples from both tracks
+    if (muxerStarted) {
+      if (vCodec != null && !videoEosReceived) {
+        drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = false)
+      }
+      if (activeAudioPipeline && aCodec != null && !audioEosReceived) {
+        drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = false)
+      }
     }
   }
 
-  private fun registerAudioTrackAndMaybeStartMuxer(format: MediaFormat) {
-    synchronized(muxerLock) {
-      if (muxerStarted || audioTrackIndex >= 0) return
-      val muxer = mediaMuxer ?: return
-      audioTrackIndex = muxer.addTrack(format)
-      maybeStartMuxerLocked()
+  private fun queueAudioEndOfStream() {
+    val codec = audioEncoder ?: return
+    val deadline = SystemClock.elapsedRealtime() + 500L
+    while (SystemClock.elapsedRealtime() < deadline) {
+      val inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+      if (inIndex >= 0) {
+        val ptsUs = (totalAudioFramesFed * 1_000_000L) / AUDIO_SAMPLE_RATE
+        codec.queueInputBuffer(
+          inIndex,
+          0,
+          0,
+          ptsUs,
+          MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+        )
+        return
+      }
+      // Drain output buffer in case encoder queue is full
+      drainSingleCodecPass(codec = codec, isVideo = false, waitForMuxerStart = !muxerStarted)
     }
   }
 
-  private fun maybeStartMuxerLocked() {
+  private fun drainEncodersUntilEosSequential() {
+    val vCodec = videoEncoder
+    val aCodec = audioEncoder
+
+    // Ensure formats are registered so muxer starts before draining remaining EOS samples
+    val formatDeadline = SystemClock.elapsedRealtime() + 1_000L
+    while (!muxerStarted && SystemClock.elapsedRealtime() < formatDeadline) {
+      if (vCodec != null && videoTrackIndex < 0) {
+        drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = true)
+      }
+      if (activeAudioPipeline && aCodec != null && audioTrackIndex < 0) {
+        drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = true)
+      }
+      if (muxerStarted) break
+      Thread.sleep(10L)
+    }
+
+    // If video track format is ready but audio format never arrived, start muxer with video track
+    if (!muxerStarted && videoTrackIndex >= 0) {
+      activeAudioPipeline = false
+      audioEosReceived = true
+      maybeStartMuxer()
+    }
+
+    // Drain video encoder until BUFFER_FLAG_END_OF_STREAM (3-second timeout)
+    if (vCodec != null) {
+      val videoDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
+      while (!videoEosReceived && SystemClock.elapsedRealtime() < videoDeadline) {
+        val drainedAny =
+          drainSingleCodecPass(codec = vCodec, isVideo = true, waitForMuxerStart = false)
+        if (!drainedAny && !videoEosReceived) {
+          Thread.sleep(10L)
+        }
+      }
+    }
+
+    // Drain audio encoder until BUFFER_FLAG_END_OF_STREAM (3-second timeout)
+    if (activeAudioPipeline && aCodec != null) {
+      val audioDeadline = SystemClock.elapsedRealtime() + EOS_DRAIN_TIMEOUT_MS
+      while (!audioEosReceived && SystemClock.elapsedRealtime() < audioDeadline) {
+        val drainedAny =
+          drainSingleCodecPass(codec = aCodec, isVideo = false, waitForMuxerStart = false)
+        if (!drainedAny && !audioEosReceived) {
+          Thread.sleep(10L)
+        }
+      }
+    }
+  }
+
+  /**
+   * Drains output buffers from [codec].
+   * When [waitForMuxerStart] is true and the track format is already registered, stops before
+   * consuming sample buffers so the initial keyframe is preserved until [mediaMuxer] starts.
+   */
+  private fun drainSingleCodecPass(
+    codec: MediaCodec,
+    isVideo: Boolean,
+    waitForMuxerStart: Boolean,
+  ): Boolean {
+    if (waitForMuxerStart) {
+      if (isVideo && videoTrackIndex >= 0) return false
+      if (!isVideo && audioTrackIndex >= 0) return false
+    }
+
+    val bufferInfo = if (isVideo) reusableVideoBufferInfo else reusableAudioBufferInfo
+    var processedAny = false
+
+    while (true) {
+      val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+      when {
+        outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
+        outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+          processedAny = true
+          val muxer = mediaMuxer
+          if (muxer != null && !muxerStarted) {
+            if (isVideo && videoTrackIndex < 0) {
+              videoTrackIndex = muxer.addTrack(codec.outputFormat)
+              maybeStartMuxer()
+            } else if (!isVideo && audioTrackIndex < 0) {
+              audioTrackIndex = muxer.addTrack(codec.outputFormat)
+              maybeStartMuxer()
+            }
+          }
+          if (waitForMuxerStart && !muxerStarted) {
+            break
+          }
+        }
+        outIndex >= 0 -> {
+          processedAny = true
+          val encodedData = codec.getOutputBuffer(outIndex)
+          val isConfigBuffer = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+          val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+
+          // Never write BUFFER_FLAG_CODEC_CONFIG buffers to the muxer
+          if (!isConfigBuffer && bufferInfo.size > 0 && encodedData != null && muxerStarted) {
+            if (isVideo && videoTrackIndex >= 0) {
+              val rawAdjustedUs = bufferInfo.presentationTimeUs - totalPausedDurationUs
+              if (videoBaseRawPtsUs < 0L) {
+                videoBaseRawPtsUs = rawAdjustedUs
+              }
+              var normalizedPtsUs = (rawAdjustedUs - videoBaseRawPtsUs).coerceAtLeast(0L)
+              if (lastVideoMuxedPtsUs >= 0L && normalizedPtsUs <= lastVideoMuxedPtsUs) {
+                // Ensure strictly monotonically increasing presentation timestamps
+                normalizedPtsUs = lastVideoMuxedPtsUs + 1_000L
+              }
+              lastVideoMuxedPtsUs = normalizedPtsUs
+              bufferInfo.presentationTimeUs = normalizedPtsUs
+
+              encodedData.position(bufferInfo.offset)
+              encodedData.limit(bufferInfo.offset + bufferInfo.size)
+              mediaMuxer?.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+              videoSamplesWritten++
+            } else if (!isVideo && audioTrackIndex >= 0) {
+              val rawPtsUs = bufferInfo.presentationTimeUs
+              if (audioBaseRawPtsUs < 0L) {
+                audioBaseRawPtsUs = rawPtsUs
+              }
+              var normalizedPtsUs = (rawPtsUs - audioBaseRawPtsUs).coerceAtLeast(0L)
+              if (lastAudioMuxedPtsUs >= 0L && normalizedPtsUs <= lastAudioMuxedPtsUs) {
+                normalizedPtsUs = lastAudioMuxedPtsUs + 500L
+              }
+              lastAudioMuxedPtsUs = normalizedPtsUs
+              bufferInfo.presentationTimeUs = normalizedPtsUs
+
+              encodedData.position(bufferInfo.offset)
+              encodedData.limit(bufferInfo.offset + bufferInfo.size)
+              mediaMuxer?.writeSampleData(audioTrackIndex, encodedData, bufferInfo)
+              audioSamplesWritten++
+            }
+          }
+
+          codec.releaseOutputBuffer(outIndex, false)
+
+          if (isEos) {
+            if (isVideo) {
+              videoEosReceived = true
+            } else {
+              audioEosReceived = true
+            }
+            break
+          }
+        }
+      }
+    }
+    return processedAny
+  }
+
+  private fun maybeStartMuxer() {
     if (muxerStarted) return
     val videoReady = videoTrackIndex >= 0
     val audioReady = !activeAudioPipeline || audioTrackIndex >= 0
     if (videoReady && audioReady) {
       mediaMuxer?.start()
       muxerStarted = true
+      debugLog("MediaMuxer started (videoTrack=$videoTrackIndex, audioTrack=$audioTrackIndex)")
     }
   }
 
-  private fun isMuxerReadyForWrite(): Boolean = muxerStarted
-
-  private fun stopMuxerSafely() {
-    synchronized(muxerLock) {
-      val muxer = mediaMuxer ?: return
-      try {
-        if (muxerStarted) {
-          muxer.stop()
-        }
-      } catch (t: Throwable) {
-        Log.w(TAG, "MediaMuxer stop warning", t)
-      } finally {
-        try {
-          muxer.release()
-        } catch (_: Throwable) {}
-        mediaMuxer = null
-        muxerStarted = false
-      }
-    }
-  }
-
-  private fun releaseAudioResources() {
+  private fun stopAndReleaseAudioOnly() {
     try {
       micAudioRecord?.let {
         if (it.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
@@ -823,16 +1074,7 @@ class ScreenRecordingEngine(
     }
   }
 
-  fun cleanupAll(deletePendingUri: Boolean = false) {
-    if (isCleanedUp.getAndSet(true)) return
-    isRunning.set(false)
-
-    try {
-      virtualDisplay?.release()
-    } catch (_: Throwable) {} finally {
-      virtualDisplay = null
-    }
-
+  private fun stopAndReleaseEncodersAndAudioRecord() {
     try {
       videoInputSurface?.release()
     } catch (_: Throwable) {} finally {
@@ -848,15 +1090,41 @@ class ScreenRecordingEngine(
       videoEncoder = null
     }
 
+    stopAndReleaseAudioOnly()
+  }
+
+  fun cleanupAllOnFailure() {
+    if (isCleanedUp.getAndSet(true)) return
+    isRunning.set(false)
+    isStopping.set(true)
+
     try {
-      videoDrainThread?.quitSafely()
+      drainHandler?.removeCallbacksAndMessages(null)
+      drainThread?.quitSafely()
     } catch (_: Throwable) {} finally {
-      videoDrainThread = null
-      videoDrainHandler = null
+      drainHandler = null
+      drainThread = null
     }
 
-    releaseAudioResources()
-    stopMuxerSafely()
+    try {
+      virtualDisplay?.release()
+    } catch (_: Throwable) {} finally {
+      virtualDisplay = null
+    }
+
+    stopAndReleaseEncodersAndAudioRecord()
+
+    val muxer = mediaMuxer
+    mediaMuxer = null
+    if (muxer != null) {
+      try {
+        if (muxerStarted) muxer.stop()
+      } catch (_: Throwable) {}
+      try {
+        muxer.release()
+      } catch (_: Throwable) {}
+      muxerStarted = false
+    }
 
     try {
       parcelFileDescriptor?.close()
@@ -864,14 +1132,12 @@ class ScreenRecordingEngine(
       parcelFileDescriptor = null
     }
 
-    if (deletePendingUri) {
-      pendingOutputUri?.let { uri ->
-        try {
-          context.contentResolver.delete(uri, null, null)
-        } catch (_: Throwable) {}
-      }
-      pendingOutputUri = null
+    pendingOutputUri?.let { uri ->
+      try {
+        context.contentResolver.delete(uri, null, null)
+      } catch (_: Throwable) {}
     }
+    pendingOutputUri = null
   }
 
   private fun roundEven(value: Int): Int {

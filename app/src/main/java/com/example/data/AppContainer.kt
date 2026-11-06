@@ -13,6 +13,7 @@ import com.example.recorder.FakeRecorderController
 import com.example.recorder.RealRecorderController
 import com.example.recorder.RecorderController
 import com.example.recorder.RecordingStateHolder
+import com.example.recorder.ScreenRecordingEngine
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -26,11 +27,11 @@ class AppContainer(
   context: Context,
   useFakeRecorder: Boolean = false,
 ) {
+  private val appContext = context.applicationContext
   private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
   val capabilitiesProvider: CapabilitiesProvider = FakeCapabilitiesProvider()
-  val settingsRepository: SettingsRepository =
-    DataStoreSettingsRepository(context.applicationContext)
+  val settingsRepository: SettingsRepository = DataStoreSettingsRepository(appContext)
   val recordingsRepository: RecordingsRepository = FakeRecordingsRepository()
 
   val recorderController: RecorderController =
@@ -68,10 +69,15 @@ class AppContainer(
         },
       )
     } else {
-      RealRecorderController(context.applicationContext)
+      RealRecorderController(appContext)
     }
 
   init {
+    // One-time startup cleanup of stale IS_PENDING = 1 files in Movies/ScreenRecorder older than 10 minutes
+    appScope.launch(Dispatchers.IO) {
+      ScreenRecordingEngine.cleanupStalePendingRecordings(appContext)
+    }
+
     appScope.launch {
       RecordingStateHolder.savedRecordings.collect { metadata ->
         val newItem =
