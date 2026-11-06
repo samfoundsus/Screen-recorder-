@@ -8,6 +8,8 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+val runNumber = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 1
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
@@ -16,8 +18,8 @@ android {
     applicationId = "com.aistudio.screenrecorder.pxlrec"
     minSdk = 29
     targetSdk = 34
-    versionCode = 1
-    versionName = "1.0.0-phase1"
+    versionCode = runNumber
+    versionName = "1.0.$runNumber"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -38,6 +40,13 @@ android {
       keyAlias = "androiddebugkey"
       keyPassword = "android"
     }
+    create("stable") {
+      val repoKeystore = file("debug.keystore")
+      storeFile = if (repoKeystore.exists()) repoKeystore else file("${rootDir}/debug.keystore")
+      storePassword = "android"
+      keyAlias = "androiddebugkey"
+      keyPassword = "android"
+    }
   }
 
   buildTypes {
@@ -50,9 +59,8 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("debugConfig")
+      // Uses the persistent repo keystore (app/debug.keystore) when present, with fallback to root debug.keystore
+      signingConfig = signingConfigs.getByName("stable")
     }
   }
   compileOptions {

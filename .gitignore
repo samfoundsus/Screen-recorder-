@@ -15,4 +15,5 @@
 .cxx
 local.properties
 .env
-debug.keystore
+/debug.keystore
+!app/debug.keystore
