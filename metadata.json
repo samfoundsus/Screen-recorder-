@@ -1,0 +1,6 @@
+{
+  "name": "Screen Recorder",
+  "description": "A Google Pixel-style Material You screen recorder app with customizable recording profiles, library management, Media3 playback, and reorderable navigation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
