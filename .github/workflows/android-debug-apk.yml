@@ -34,7 +34,9 @@ jobs:
 
       - name: Ensure stable debug keystore exists in repository
         run: |
-          if [ ! -f app/debug.keystore ]; then
+          if [ -f app/debug.keystore ]; then
+            echo "Using existing committed app/debug.keystore"
+          else
             mkdir -p app
             keytool -genkeypair -v \
               -keystore app/debug.keystore \
@@ -64,6 +66,21 @@ jobs:
           fi
           cp "$APK_SOURCE" "ScreenRecorder-v${{ github.run_number }}.apk"
 
+      - name: Verify APK signature and print SHA-256 fingerprint
+        id: apk_cert
+        run: |
+          APK_FILE="ScreenRecorder-v${{ github.run_number }}.apk"
+          APKSIGNER=$(find "$ANDROID_HOME/build-tools" -name "apksigner" | sort -V | tail -n 1)
+          if [ -z "$APKSIGNER" ]; then
+            echo "Error: apksigner not found in $ANDROID_HOME/build-tools"
+            exit 1
+          fi
+          CERT_OUTPUT=$("$APKSIGNER" verify --print-certs "$APK_FILE")
+          echo "$CERT_OUTPUT"
+          SHA256_DIGEST=$(echo "$CERT_OUTPUT" | sed -n 's/.*SHA-256 digest: \([0-9a-fA-F:]*\).*/\1/p' | head -n 1)
+          echo "Signing certificate SHA-256: $SHA256_DIGEST"
+          echo "sha256=$SHA256_DIGEST" >> "$GITHUB_OUTPUT"
+
       - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -76,9 +93,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           APK_FILE="ScreenRecorder-v${{ github.run_number }}.apk"
+          VERSION_CODE=$((1000 + ${{ github.run_number }}))
           RELEASE_TAG="latest"
           RELEASE_TITLE="Screen Recorder v1.0.${{ github.run_number }}"
-          RELEASE_NOTES="Automated debug build v1.0.${{ github.run_number }} (versionCode ${{ github.run_number }}) signed with the repository's persistent debug keystore."
+          RELEASE_NOTES=$(printf "Automated debug build v1.0.%s (versionCode %s) signed with the repository's persistent debug keystore.\n\nSigning Certificate SHA-256: %s" "${{ github.run_number }}" "$VERSION_CODE" "${{ steps.apk_cert.outputs.sha256 }}")
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

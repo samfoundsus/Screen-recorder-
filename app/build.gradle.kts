@@ -18,7 +18,7 @@ android {
     applicationId = "com.aistudio.screenrecorder.pxlrec"
     minSdk = 29
     targetSdk = 34
-    versionCode = runNumber
+    versionCode = 1000 + runNumber
     versionName = "1.0.$runNumber"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -41,8 +41,7 @@ android {
       keyPassword = "android"
     }
     create("stable") {
-      val repoKeystore = file("debug.keystore")
-      storeFile = if (repoKeystore.exists()) repoKeystore else file("${rootDir}/debug.keystore")
+      storeFile = file("debug.keystore")
       storePassword = "android"
       keyAlias = "androiddebugkey"
       keyPassword = "android"
@@ -59,7 +58,6 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      // Uses the persistent repo keystore (app/debug.keystore) when present, with fallback to root debug.keystore
       signingConfig = signingConfigs.getByName("stable")
     }
   }
