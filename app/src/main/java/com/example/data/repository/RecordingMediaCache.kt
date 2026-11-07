@@ -84,7 +84,6 @@ object RecordingMediaCache {
       hasAudio = metadata.hasAudio,
       audioChannelMode = metadata.audioChannelMode,
       noiseSuppression = metadata.noiseSuppression,
-      requestedFps = metadata.requestedFps,
     )
     putMetadata(uriString, metadata)
   }
@@ -202,7 +201,7 @@ object RecordingMediaCache {
           val hasAudioRetriever =
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) != null
 
-          val extractorInfo = extractTrackInfoWithMediaExtractor(context, uri, durationMs)
+          val extractorInfo = extractTrackInfoWithMediaExtractor(context, uri)
           val extractedFps =
             captureFramerate
               ?: extractorInfo.fps
@@ -247,8 +246,6 @@ object RecordingMediaCache {
             hasAudio = resolvedHasAudio,
             audioChannelMode = resolvedChannelMode,
             noiseSuppression = resolvedNoiseSuppression,
-            measuredAvgFps = extractorInfo.measuredAvgFps,
-            requestedFps = persistedAudio?.requestedFps,
           )
         } catch (_: Throwable) {
           VideoMetadata(
@@ -261,8 +258,6 @@ object RecordingMediaCache {
             hasAudio = persistedAudio?.hasAudio ?: true,
             audioChannelMode = persistedAudio?.audioChannelMode ?: "Stereo",
             noiseSuppression = persistedAudio?.noiseSuppression ?: false,
-            measuredAvgFps = null,
-            requestedFps = persistedAudio?.requestedFps,
           )
         } finally {
           try {
@@ -290,14 +285,12 @@ object RecordingMediaCache {
     val fps: Int?,
     val hasAudioTrack: Boolean?,
     val audioChannelCount: Int?,
-    val measuredAvgFps: Double? = null,
   )
 
   private data class PersistedAudioMeta(
     val hasAudio: Boolean,
     val audioChannelMode: String,
     val noiseSuppression: Boolean,
-    val requestedFps: Int? = null,
   )
 
   private fun savePersistedAudioMeta(
@@ -306,15 +299,13 @@ object RecordingMediaCache {
     hasAudio: Boolean,
     audioChannelMode: String,
     noiseSuppression: Boolean,
-    requestedFps: Int? = null,
   ) {
     try {
       val prefs = context.applicationContext.getSharedPreferences(PREFS_AUDIO_META, Context.MODE_PRIVATE)
       val normalizedChannel = if (audioChannelMode.equals("Mono", ignoreCase = true)) "Mono" else "Stereo"
-      val reqFpsStr = requestedFps?.toString() ?: ""
       prefs
         .edit()
-        .putString(uriString, "$hasAudio|$normalizedChannel|$noiseSuppression|$reqFpsStr")
+        .putString(uriString, "$hasAudio|$normalizedChannel|$noiseSuppression")
         .apply()
     } catch (_: Throwable) {}
   }
@@ -324,20 +315,18 @@ object RecordingMediaCache {
       val prefs = context.applicationContext.getSharedPreferences(PREFS_AUDIO_META, Context.MODE_PRIVATE)
       val raw = prefs.getString(uriString, null) ?: return null
       val parts = raw.split("|")
-      if (parts.size < 3) return null
-      val reqFps = if (parts.size >= 4) parts[3].toIntOrNull() else null
+      if (parts.size != 3) return null
       PersistedAudioMeta(
         hasAudio = parts[0].toBooleanStrictOrNull() ?: true,
         audioChannelMode = if (parts[1].equals("Mono", ignoreCase = true)) "Mono" else "Stereo",
         noiseSuppression = parts[2].toBooleanStrictOrNull() ?: false,
-        requestedFps = reqFps,
       )
     } catch (_: Throwable) {
       null
     }
   }
 
-  private fun extractTrackInfoWithMediaExtractor(context: Context, uri: Uri, durationMs: Long?): ExtractorTrackInfo {
+  private fun extractTrackInfoWithMediaExtractor(context: Context, uri: Uri): ExtractorTrackInfo {
     val extractor = MediaExtractor()
     return try {
       extractor.setDataSource(context, uri, null)
@@ -361,49 +350,27 @@ object RecordingMediaCache {
       }
 
       var resolvedFps: Int? = null
-      var measuredAvgFps: Double? = null
-
-      if (videoTrackIndex >= 0) {
+      if (formatFps != null && formatFps > 0) {
+        resolvedFps = snapToStandardFps(formatFps.toDouble())
+      } else if (videoTrackIndex >= 0) {
         extractor.selectTrack(videoTrackIndex)
-        var totalVideoSamples = 0L
-        var firstPtsUs = -1L
-        var lastPtsUs = -1L
         val deltasUs = mutableListOf<Long>()
         var prevPtsUs = -1L
-
-        while (true) {
+        var samplesRead = 0
+        while (samplesRead < 90) {
           val ptsUs = extractor.sampleTime
           if (ptsUs < 0L) break
-          if (firstPtsUs < 0L) firstPtsUs = ptsUs
-          lastPtsUs = ptsUs
-          totalVideoSamples++
-
-          if (deltasUs.size < 90 && prevPtsUs >= 0L) {
+          if (prevPtsUs >= 0L) {
             val delta = ptsUs - prevPtsUs
             if (delta in 4_000L..100_000L) {
               deltasUs.add(delta)
             }
           }
           prevPtsUs = ptsUs
+          samplesRead++
           if (!extractor.advance()) break
         }
-
-        if (totalVideoSamples > 0L) {
-          val durationSec = when {
-            durationMs != null && durationMs > 0L -> durationMs.toDouble() / 1000.0
-            firstPtsUs >= 0L && lastPtsUs > firstPtsUs -> (lastPtsUs - firstPtsUs).toDouble() / 1_000_000.0
-            else -> 0.0
-          }
-          if (durationSec > 0.0) {
-            measuredAvgFps = totalVideoSamples.toDouble() / durationSec
-          }
-        }
-
-        if (formatFps != null && formatFps > 0) {
-          resolvedFps = snapToStandardFps(formatFps.toDouble())
-        } else if (measuredAvgFps != null && measuredAvgFps > 0.0) {
-          resolvedFps = snapToStandardFps(measuredAvgFps)
-        } else if (deltasUs.isNotEmpty()) {
+        if (deltasUs.isNotEmpty()) {
           deltasUs.sort()
           val idx = (deltasUs.size * 0.25).toInt().coerceIn(0, deltasUs.lastIndex)
           val representativeDeltaUs = deltasUs[idx]
@@ -412,22 +379,18 @@ object RecordingMediaCache {
             resolvedFps = snapToStandardFps(rawFps)
           }
         }
-      } else if (formatFps != null && formatFps > 0) {
-        resolvedFps = snapToStandardFps(formatFps.toDouble())
       }
 
       ExtractorTrackInfo(
         fps = resolvedFps,
         hasAudioTrack = foundAudioTrack,
         audioChannelCount = audioChannels,
-        measuredAvgFps = measuredAvgFps,
       )
     } catch (_: Throwable) {
       ExtractorTrackInfo(
         fps = null,
         hasAudioTrack = null,
         audioChannelCount = null,
-        measuredAvgFps = null,
       )
     } finally {
       try {

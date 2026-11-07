@@ -27,7 +27,6 @@ data class GeneralSettings(
 )
 
 data class VideoSettings(
-  val performanceMode: String = "Balanced",
   val resolution: String = "1080p",
   val fps: Int = 60,
   val bitrateMbps: Int = 12,

@@ -631,29 +631,9 @@ fun PlaybackScreen(
             )
 
             FlatDetailRow(label = "Resolution", value = resolvedResolution)
-            val reqFps = metadata?.requestedFps ?: recording.fps
-            val measuredFps = metadata?.measuredAvgFps
-            val recordedFpsText = when {
-              measuredFps != null && measuredFps > 0.0 -> {
-                val recordedFpsInt = Math.round(measuredFps).toInt()
-                if (reqFps != null && reqFps > 0) {
-                  "Requested $reqFps fps · Recorded $recordedFpsInt fps average"
-                } else {
-                  "Recorded $recordedFpsInt fps average"
-                }
-              }
-              resolvedFps != null && resolvedFps > 0 -> {
-                if (reqFps != null && reqFps > 0 && reqFps != resolvedFps) {
-                  "Requested $reqFps fps · Recorded $resolvedFps fps average"
-                } else {
-                  "$resolvedFps FPS"
-                }
-              }
-              else -> "Variable"
-            }
             FlatDetailRow(
               label = "Frame rate",
-              value = recordedFpsText,
+              value = if (resolvedFps != null && resolvedFps > 0) "$resolvedFps FPS" else "Variable",
             )
             FlatDetailRow(
               label = "Codec and container",

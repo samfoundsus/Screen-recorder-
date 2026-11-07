@@ -9,8 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 data class MemoryDiagnosticSnapshot(
-  val recorderPssKb: Int = 0,
-  val uiPssKb: Int = 0,
+  val currentPssKb: Int = 0,
   val peakLastRecordingPssKb: Int = 0,
   val nativeHeapSizeKb: Long = 0L,
   val nativeHeapAllocatedKb: Long = 0L,
@@ -18,17 +17,8 @@ data class MemoryDiagnosticSnapshot(
   val activeCodecs: Int = 0,
   val activeThreads: Int = 0,
 ) {
-  val recorderPssMbText: String
-    get() = if (recorderPssKb > 0) String.format(Locale.US, "%.1f MB", recorderPssKb / 1024.0) else "Idle"
-
-  val uiPssMbText: String
-    get() = String.format(Locale.US, "%.1f MB", uiPssKb / 1024.0)
-
   val currentPssMbText: String
-    get() = if (recorderPssKb > 0) recorderPssMbText else uiPssMbText
-
-  val currentPssKb: Int
-    get() = if (recorderPssKb > 0) recorderPssKb else uiPssKb
+    get() = String.format(Locale.US, "%.1f MB", currentPssKb / 1024.0)
 
   val peakLastRecordingPssMbText: String
     get() =
@@ -40,13 +30,16 @@ data class MemoryDiagnosticSnapshot(
 
   val summaryText: String
     get() =
-      "Recorder: $recorderPssMbText • UI: $uiPssMbText • Peak: $peakLastRecordingPssMbText"
+      if (peakLastRecordingPssKb > 0) {
+        "Current: $currentPssMbText • Peak last recording: $peakLastRecordingPssMbText"
+      } else {
+        "Current: $currentPssMbText • Peak last recording: —"
+      }
 }
 
 /**
  * Debug-only memory diagnostics sampler and logger (excluded from release builds via source sets).
- * Logs TAG "MemCheck" every 10 seconds in the :recorder process while recording and tracks
- * recorder process PSS, UI process PSS, and peak recorder PSS fetched over Messenger IPC.
+ * Logs TAG "MemCheck" every 10 seconds while recording and tracks current and peak recording PSS.
  */
 object MemoryDiagnostics {
   const val TAG = "MemCheck"
@@ -72,79 +65,15 @@ object MemoryDiagnostics {
     sessionPeakPssKb = 0
   }
 
-  /**
-   * Called in the :recorder process every 10 seconds while recording.
-   * Logs TAG "MemCheck": totalPss, native heap, Java heap, number of threads.
-   */
   fun sampleAndLogWhileRecording(context: Context) {
-    val memInfo = Debug.MemoryInfo()
-    Debug.getMemoryInfo(memInfo)
-    val totalPssKb = memInfo.totalPss.coerceAtLeast(0)
-
-    if (totalPssKb > sessionPeakPssKb) {
-      sessionPeakPssKb = totalPssKb
-      persistedPeakPssKb = sessionPeakPssKb
-      try {
-        context
-          .applicationContext
-          .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-          .edit()
-          .putInt(KEY_PEAK_LAST_RECORDING_PSS_KB, persistedPeakPssKb)
-          .apply()
-      } catch (_: Throwable) {}
-    }
-
-    val nativeHeapSizeKb = Debug.getNativeHeapSize() / 1024L
-    val nativeHeapAllocatedKb = Debug.getNativeHeapAllocatedSize() / 1024L
-    val runtime = Runtime.getRuntime()
-    val javaHeapUsedKb = ((runtime.totalMemory() - runtime.freeMemory()) / 1024L).coerceAtLeast(0L)
-    val activeCodecs = ScreenRecordingEngine.activeCodecCount.get().coerceAtLeast(0)
-    val activeThreads = Thread.activeCount()
-
-    val pssMbText = String.format(Locale.US, "%.1f MB", totalPssKb / 1024.0)
-
+    val snap = captureSnapshot(context, updateSessionPeak = true)
     Log.d(
       TAG,
-      "totalPss=${totalPssKb}KB ($pssMbText), " +
-        "peakRecordingPss=${sessionPeakPssKb}KB, " +
-        "nativeHeapSize=${nativeHeapSizeKb}KB (allocated=${nativeHeapAllocatedKb}KB), " +
-        "javaHeapUsed=${javaHeapUsedKb}KB, " +
-        "activeCodecs=$activeCodecs, activeThreads=$activeThreads",
-    )
-  }
-
-  fun getCurrentRecorderStats(context: Context): RecorderStatsPayload {
-    if (persistedPeakPssKb == 0) {
-      try {
-        val prefs =
-          context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        persistedPeakPssKb = prefs.getInt(KEY_PEAK_LAST_RECORDING_PSS_KB, 0).coerceAtLeast(0)
-      } catch (_: Throwable) {}
-    }
-    val memInfo = Debug.MemoryInfo()
-    Debug.getMemoryInfo(memInfo)
-    val totalPssKb = memInfo.totalPss.coerceAtLeast(0)
-
-    if (totalPssKb > sessionPeakPssKb) {
-      sessionPeakPssKb = totalPssKb
-      persistedPeakPssKb = sessionPeakPssKb
-    }
-
-    val nativeHeapSizeKb = Debug.getNativeHeapSize() / 1024L
-    val nativeHeapAllocatedKb = Debug.getNativeHeapAllocatedSize() / 1024L
-    val runtime = Runtime.getRuntime()
-    val javaHeapUsedKb = ((runtime.totalMemory() - runtime.freeMemory()) / 1024L).coerceAtLeast(0L)
-    val activeCodecs = ScreenRecordingEngine.activeCodecCount.get().coerceAtLeast(0)
-    val activeThreads = Thread.activeCount()
-
-    return RecorderStatsPayload(
-      recorderPssKb = totalPssKb,
-      peakPssKb = if (sessionPeakPssKb > persistedPeakPssKb) sessionPeakPssKb else persistedPeakPssKb,
-      nativeHeapSizeKb = nativeHeapSizeKb,
-      nativeHeapAllocatedKb = nativeHeapAllocatedKb,
-      javaHeapUsedKb = javaHeapUsedKb,
-      activeCodecs = activeCodecs,
-      activeThreads = activeThreads,
+      "totalPss=${snap.currentPssKb}KB (${snap.currentPssMbText}), " +
+        "peakRecordingPss=${snap.peakLastRecordingPssKb}KB, " +
+        "nativeHeapSize=${snap.nativeHeapSizeKb}KB (allocated=${snap.nativeHeapAllocatedKb}KB), " +
+        "javaHeapUsed=${snap.javaHeapUsedKb}KB, " +
+        "activeCodecs=${snap.activeCodecs}, activeThreads=${snap.activeThreads}",
     )
   }
 
@@ -160,12 +89,17 @@ object MemoryDiagnostics {
           .apply()
       } catch (_: Throwable) {}
     }
+    captureSnapshot(context, updateSessionPeak = false)
   }
 
-  /**
-   * Refreshes UI process snapshot and triggers Messenger query to :recorder.
-   */
   fun refreshSnapshot(context: Context): MemoryDiagnosticSnapshot {
+    return captureSnapshot(context, updateSessionPeak = false)
+  }
+
+  private fun captureSnapshot(
+    context: Context,
+    updateSessionPeak: Boolean,
+  ): MemoryDiagnosticSnapshot {
     if (persistedPeakPssKb == 0) {
       try {
         val prefs =
@@ -176,59 +110,42 @@ object MemoryDiagnostics {
 
     val memInfo = Debug.MemoryInfo()
     Debug.getMemoryInfo(memInfo)
-    val uiPssKb = memInfo.totalPss.coerceAtLeast(0)
+    val totalPssKb = memInfo.totalPss.coerceAtLeast(0)
+
+    if (updateSessionPeak && totalPssKb > sessionPeakPssKb) {
+      sessionPeakPssKb = totalPssKb
+      persistedPeakPssKb = sessionPeakPssKb
+      try {
+        context
+          .applicationContext
+          .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+          .edit()
+          .putInt(KEY_PEAK_LAST_RECORDING_PSS_KB, persistedPeakPssKb)
+          .apply()
+      } catch (_: Throwable) {}
+    }
 
     val nativeHeapSizeKb = Debug.getNativeHeapSize() / 1024L
     val nativeHeapAllocatedKb = Debug.getNativeHeapAllocatedSize() / 1024L
     val runtime = Runtime.getRuntime()
     val javaHeapUsedKb = ((runtime.totalMemory() - runtime.freeMemory()) / 1024L).coerceAtLeast(0L)
+    val activeCodecs = ScreenRecordingEngine.activeCodecCount.get().coerceAtLeast(0)
     val activeThreads = Thread.activeCount()
 
-    val current = _snapshot.value
+    val peakToDisplay =
+      if (sessionPeakPssKb > persistedPeakPssKb) sessionPeakPssKb else persistedPeakPssKb
+
     val next =
-      current.copy(
-        uiPssKb = uiPssKb,
-        peakLastRecordingPssKb = if (current.peakLastRecordingPssKb > 0) current.peakLastRecordingPssKb else persistedPeakPssKb,
+      MemoryDiagnosticSnapshot(
+        currentPssKb = totalPssKb,
+        peakLastRecordingPssKb = peakToDisplay,
         nativeHeapSizeKb = nativeHeapSizeKb,
         nativeHeapAllocatedKb = nativeHeapAllocatedKb,
         javaHeapUsedKb = javaHeapUsedKb,
+        activeCodecs = activeCodecs,
         activeThreads = activeThreads,
       )
     _snapshot.value = next
-
-    // Trigger asynchronous query to recorder process via Messenger
-    try {
-      com.example.recorder.ipc.RecorderClient.requestMemoryStats()
-    } catch (_: Throwable) {}
-
     return next
   }
-
-  fun updateRecorderMemoryStats(
-    recorderPssKb: Int,
-    peakPssKb: Int,
-    nativeHeapSizeKb: Long,
-    nativeHeapAllocatedKb: Long,
-    javaHeapUsedKb: Long,
-    activeCodecs: Int,
-    activeThreads: Int,
-  ) {
-    val peak = if (peakPssKb > 0) peakPssKb else persistedPeakPssKb
-    _snapshot.value =
-      _snapshot.value.copy(
-        recorderPssKb = recorderPssKb,
-        peakLastRecordingPssKb = peak,
-        activeCodecs = activeCodecs,
-      )
-  }
-
-  data class RecorderStatsPayload(
-    val recorderPssKb: Int,
-    val peakPssKb: Int,
-    val nativeHeapSizeKb: Long,
-    val nativeHeapAllocatedKb: Long,
-    val javaHeapUsedKb: Long,
-    val activeCodecs: Int,
-    val activeThreads: Int,
-  )
 }

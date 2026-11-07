@@ -18,8 +18,8 @@ android {
     applicationId = "com.aistudio.screenrecorder.pxlrec"
     minSdk = 29
     targetSdk = 34
-    versionCode = 1000 + runNumber + 4
-    versionName = "1.0.${runNumber + 4}"
+    versionCode = 1000 + runNumber
+    versionName = "1.0.$runNumber"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

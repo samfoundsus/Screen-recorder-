@@ -19,21 +19,20 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.data.repository.DataStoreSettingsRepository
 import com.example.domain.model.AppSettings
-import com.example.recorder.ipc.RecorderClient
-import com.example.recorder.ipc.RecorderSettingsSnapshot
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 /**
  * Transparent, no-UI trampoline activity supporting two flows:
  * 1. [MODE_SHOW_CONTROLS] (launched from Quick Settings tile when idle):
- *    - If overlay permission ([Settings.canDrawOverlays]) is granted, sends snapshot to
- *      [RecorderClient.showControls] and finishes immediately.
+ *    - If overlay permission ([Settings.canDrawOverlays]) is granted, starts [RecorderService] in
+ *      "controls only" mode and finishes immediately.
  *    - If overlay permission is missing, displays a dialog offering to open the system
- *      "Display over other apps" settings page.
+ *      "Display over other apps" settings page. If the user declines (or returns without granting),
+ *      gracefully falls back to the direct [MediaProjection] consent flow and never crashes.
  * 2. [MODE_START_RECORDING] (launched when tapping Start on the floating controls):
  *    - Requests runtime permissions if missing, launches [MediaProjectionManager.createScreenCaptureIntent],
- *      starts [RecorderClient.startRecording] with the snapshot, and finishes immediately.
+ *      starts [RecorderService] with the result, and finishes immediately.
  */
 class QuickTileLaunchActivity : ComponentActivity() {
 
@@ -68,6 +67,7 @@ class QuickTileLaunchActivity : ComponentActivity() {
       if (Settings.canDrawOverlays(applicationContext)) {
         startControlsOnlyServiceAndFinish()
       } else {
+        // User returned without granting overlay permission: fall back to direct MediaProjection flow
         launchedFromFloatingControls = false
         startDirectMediaProjectionFlow()
       }
@@ -103,10 +103,9 @@ class QuickTileLaunchActivity : ComponentActivity() {
       val data = result.data
       if (result.resultCode == Activity.RESULT_OK && data != null && settings != null) {
         if (!ScreenRecordingEngine.hasEnoughStorageToStart(applicationContext)) {
-          val minMb = ScreenRecordingEngine.getMinimumStorageStartBytes(applicationContext) / (1024 * 1024)
           RecordingStateHolder.setPendingSnackbarMessage(
             applicationContext,
-            "Not enough storage space to start recording (at least $minMb MB required).",
+            "Not enough storage space to start recording (at least 300 MB required).",
           )
           restoreControlsIfNeeded()
           ScreenRecorderTileService.requestTileUpdate(applicationContext)
@@ -114,27 +113,15 @@ class QuickTileLaunchActivity : ComponentActivity() {
           return@registerForActivityResult
         }
         try {
-          val (px, py) = RecorderClient.loadSavedPositionFractions(applicationContext, isLandscape = false)
-          val (lx, ly) = RecorderClient.loadSavedPositionFractions(applicationContext, isLandscape = true)
-          val (snapshot, gamingSnackbar) =
-            RecorderSettingsSnapshot.createForRecording(
-              settings = settings,
+          val serviceIntent =
+            RecorderService.createStartIntent(
               context = applicationContext,
-              portraitXFrac = px,
-              portraitYFrac = py,
-              landscapeXFrac = lx,
-              landscapeYFrac = ly,
+              resultCode = result.resultCode,
+              resultData = data,
+              settings = settings,
+              restoreControlsAfterStop = launchedFromFloatingControls,
             )
-          if (gamingSnackbar != null) {
-            RecordingStateHolder.setPendingSnackbarMessage(applicationContext, gamingSnackbar)
-          }
-          RecorderClient.startRecording(
-            context = applicationContext,
-            resultCode = result.resultCode,
-            resultData = data,
-            snapshot = snapshot,
-            restoreControlsAfterStop = launchedFromFloatingControls,
-          )
+          ContextCompat.startForegroundService(applicationContext, serviceIntent)
         } catch (t: Throwable) {
           Log.e(ScreenRecordingEngine.TAG, "Failed to start RecorderService", t)
           RecordingStateHolder.setPendingSnackbarMessage(
@@ -241,27 +228,13 @@ class QuickTileLaunchActivity : ComponentActivity() {
   }
 
   private fun startControlsOnlyServiceAndFinish() {
-    lifecycleScope.launch {
-      try {
-        val settingsRepository = DataStoreSettingsRepository(applicationContext)
-        val settings = settingsRepository.settings.first()
-        val (px, py) = RecorderClient.loadSavedPositionFractions(applicationContext, isLandscape = false)
-        val (lx, ly) = RecorderClient.loadSavedPositionFractions(applicationContext, isLandscape = true)
-        val snapshot =
-          RecorderSettingsSnapshot.fromAppSettings(
-            settings = settings,
-            portraitXFrac = px,
-            portraitYFrac = py,
-            landscapeXFrac = lx,
-            landscapeYFrac = ly,
-          )
-        RecorderClient.showControls(applicationContext, snapshot)
-      } catch (t: Throwable) {
-        Log.e(ScreenRecordingEngine.TAG, "Failed to show controls from QuickTileLaunchActivity", t)
-      }
-      ScreenRecorderTileService.requestTileUpdate(applicationContext)
-      finishWithoutAnimation()
+    try {
+      startService(RecorderService.createShowControlsIntent(applicationContext))
+    } catch (t: Throwable) {
+      Log.e(ScreenRecordingEngine.TAG, "Failed to start controls-only RecorderService", t)
     }
+    ScreenRecorderTileService.requestTileUpdate(applicationContext)
+    finishWithoutAnimation()
   }
 
   private fun startDirectMediaProjectionFlow() {
@@ -334,14 +307,9 @@ class QuickTileLaunchActivity : ComponentActivity() {
 
   private fun restoreControlsIfNeeded() {
     if (launchedFromFloatingControls && Settings.canDrawOverlays(applicationContext)) {
-      lifecycleScope.launch {
-        try {
-          val settingsRepository = DataStoreSettingsRepository(applicationContext)
-          val settings = settingsRepository.settings.first()
-          val snapshot = RecorderSettingsSnapshot.fromAppSettings(settings)
-          RecorderClient.showControls(applicationContext, snapshot)
-        } catch (_: Throwable) {}
-      }
+      try {
+        startService(RecorderService.createShowControlsIntent(applicationContext))
+      } catch (_: Throwable) {}
     }
   }
 

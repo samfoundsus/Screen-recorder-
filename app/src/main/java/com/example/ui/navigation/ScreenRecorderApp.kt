@@ -306,7 +306,6 @@ fun ScreenRecorderApp(
                 settingsViewModel.updateShowInQuickSettings(context, enabled)
               },
               onUpdateCountdownSeconds = settingsViewModel::updateCountdownSeconds,
-              onUpdatePerformanceMode = settingsViewModel::updatePerformanceMode,
               onUpdateResolution = settingsViewModel::updateResolution,
               onUpdateFps = settingsViewModel::updateFps,
               onUpdateBitrate = settingsViewModel::updateBitrate,

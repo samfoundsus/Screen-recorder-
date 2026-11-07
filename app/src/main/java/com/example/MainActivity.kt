@@ -1,9 +1,11 @@
 /*
- * Memory & Hardening Fixes (Low-RAM & Process Split Pass):
- * 1. Binds to out-of-process RecorderService (:recorder) via RecorderClient to monitor live state.
- * 2. Implements onTrimMemory: at TRIM_MEMORY_UI_HIDDEN and above, clears thumbnail caches.
- * 3. Media3 ExoPlayer released in onStop in PlaybackScreen.
- * 4. Tracks app foreground state across rotation and configuration changes with debounce.
+ * Memory & Hardening Fixes (Phase 2C):
+ * 1. Added onStop() and onTrimMemory() handlers to clear cached thumbnail Bitmaps when the app
+ *    moves to the background, reducing memory footprint while recording in the background.
+ * 2. Handled EXTRA_OPEN_DESTINATION in onCreate() and onNewIntent() so tapping a non-user-stop
+ *    notification opens the Library directly.
+ * 3. Initialized debug MemoryDiagnostics on startup (no-op in release).
+ * 4. Registered activity lifecycle callbacks on RecordingStateHolder to track app foreground state.
  */
 package com.example
 
@@ -24,7 +26,6 @@ import com.example.recorder.MemoryDiagnostics
 import com.example.recorder.RecordingPermissionCoordinator
 import com.example.recorder.RecordingStateHolder
 import com.example.recorder.ScreenRecorderTileService
-import com.example.recorder.ipc.RecorderClient
 import com.example.ui.navigation.ScreenRecorderApp
 import kotlinx.coroutines.launch
 
@@ -46,11 +47,8 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
-    RecorderClient.bind(applicationContext)
     RecordingStateHolder.registerActivityLifecycle(application)
     RecordingStateHolder.setAppInForeground(true)
-    RecorderClient.setAppInForeground(true)
-
     MemoryDiagnostics.initialize(applicationContext)
     appContainer = AppContainer(applicationContext)
     permissionCoordinator =
@@ -92,9 +90,7 @@ class MainActivity : ComponentActivity() {
 
   override fun onResume() {
     super.onResume()
-    RecorderClient.ensureConnected(applicationContext)
     RecordingStateHolder.setAppInForeground(true)
-    RecorderClient.setAppInForeground(true)
     RecordingStateHolder.loadPendingSnackbarIfNeeded(applicationContext)
     ScreenRecorderTileService.requestTileUpdate(applicationContext)
   }
@@ -102,11 +98,6 @@ class MainActivity : ComponentActivity() {
   override fun onStop() {
     super.onStop()
     RecordingMediaCache.clearThumbnails()
-  }
-
-  override fun onDestroy() {
-    RecorderClient.unbind(applicationContext)
-    super.onDestroy()
   }
 
   @Suppress("DEPRECATION")

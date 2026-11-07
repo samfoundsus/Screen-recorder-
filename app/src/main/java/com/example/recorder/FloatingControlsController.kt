@@ -30,38 +30,43 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.example.MainActivity
 import com.example.R
+import com.example.data.capabilities.CapabilityProbe
+import com.example.domain.model.AppSettings
 import com.example.domain.model.RecorderState
-import com.example.recorder.ipc.RecorderSettingsSnapshot
+import com.example.domain.repository.SettingsRepository
 import com.example.ui.navigation.AppRoutes
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.MaterialColors
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 
 /**
  * Lightweight plain-View floating controls controller owned by [RecorderService].
- * Runs entirely in the `:recorder` process without DataStore, Room, Compose, or Media3 dependencies.
+ * Uses zero Compose dependencies to keep memory footprint well under 5 MB.
  *
  * Theming:
  * - Builds all overlay views with a themed context wrapping the service context in
  *   `Theme.Material3.DayNight.NoActionBar` followed by `DynamicColors.wrapContextIfAvailable()`.
  * - Reads all colors from Material 3 theme attributes via [MaterialColors.getColor] with zero
  *   hardcoded color literals.
- * - Live-updates colors when system configuration changes.
+ * - Live-updates colors when the system theme (dark/light) or dynamic wallpaper colors change.
  */
 class FloatingControlsController(
   private val context: Context,
-  private var currentSnapshot: RecorderSettingsSnapshot,
+  private val settingsRepository: SettingsRepository,
   private val onStartRequested: () -> Unit,
   private val onPauseRequested: () -> Unit,
   private val onResumeRequested: () -> Unit,
   private val onStopRequested: () -> Unit,
   private val onCloseRequested: () -> Unit,
-  private val onControlsVisibilityChanged: ((Boolean) -> Unit)? = null,
-  private val onPositionChanged: ((portraitX: Float, portraitY: Float, landscapeX: Float, landscapeY: Float) -> Unit)? = null,
-  private val onQuickSettingChanged: ((resolution: String, fps: Int, audioSource: String) -> Unit)? = null,
-  private val elapsedMsSupplier: () -> Long = { 0L },
 ) {
 
   companion object {
@@ -91,12 +96,16 @@ class FloatingControlsController(
   private val windowManager =
     context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
   private val mainHandler = Handler(Looper.getMainLooper())
+  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
   private var themedContext: Context = createOverlayThemedContext(context)
 
+  private var settingsJob: Job? = null
+  private var recorderStateJob: Job? = null
+
+  private var currentSettings: AppSettings = AppSettings()
   private var currentRecorderState: RecorderState = RecorderState.IDLE
   private var isInRecordingSession: Boolean = false
-  private var currentElapsedMs: Long = 0L
 
   // Window views
   private var pillRootView: FrameLayout? = null
@@ -149,77 +158,86 @@ class FloatingControlsController(
         ) {
           return
         }
-        currentElapsedMs = elapsedMsSupplier()
-        updateTimerTextInPlace(tv, currentElapsedMs)
+        updateTimerTextInPlace(tv, RecordingStateHolder.elapsedTimeMs.value)
         if (currentRecorderState == RecorderState.RECORDING && !isShrunkToEdgeHandle) {
           mainHandler.postDelayed(this, TIMER_TICK_MS)
         }
       }
     }
 
+  init {
+    settingsJob =
+      scope.launch {
+        settingsRepository.settings.collectLatest { updated ->
+          val prevFloating = currentSettings.floatingControls
+          val prevAppearance = currentSettings.appearance
+          currentSettings = updated
+          refreshPanelValues()
+          if (pillRootView != null) {
+            if (prevFloating.size != updated.floatingControls.size) {
+              rebuildPillIfAttached()
+            } else {
+              if (prevAppearance != updated.appearance) {
+                themedContext = createOverlayThemedContext(context)
+                reTintOverlayViews()
+              }
+              syncWindowFlagSecure()
+              applyIdleOpacity()
+              if (shouldAutoCollapseToHandle()) {
+                scheduleAutoHide()
+              } else if (isShrunkToEdgeHandle && !isRecordingMode()) {
+                expandFromEdgeHandle()
+              }
+            }
+          }
+        }
+      }
+
+    recorderStateJob =
+      scope.launch {
+        RecordingStateHolder.recorderState.collectLatest { state ->
+          val previousState = currentRecorderState
+          currentRecorderState = state
+          if (state != RecorderState.IDLE) {
+            isInRecordingSession = true
+          } else {
+            isInRecordingSession = false
+          }
+          if (pillRootView != null) {
+            if (state != RecorderState.IDLE) {
+              syncWindowFlagSecure()
+              bindPillState()
+              if (previousState == RecorderState.IDLE && !isShrunkToEdgeHandle) {
+                shrinkToEdgeHandle()
+              } else {
+                applyIdleOpacity()
+                scheduleAutoHide()
+              }
+            } else {
+              syncWindowFlagSecure()
+              bindPillState()
+              applyIdleOpacity()
+              scheduleAutoHide()
+            }
+          }
+        }
+      }
+  }
+
   val isAttached: Boolean
     get() = pillRootView != null
 
   val keepEdgeHandleWhileRecording: Boolean
-    get() = currentSnapshot.keepEdgeHandleWhileRecording
-
-  fun updateSettings(snapshot: RecorderSettingsSnapshot) {
-    val prevSize = currentSnapshot.floatingControlsSize
-    currentSnapshot = snapshot
-    refreshPanelValues()
-    if (pillRootView != null) {
-      if (prevSize != snapshot.floatingControlsSize) {
-        rebuildPillIfAttached()
-      } else {
-        syncWindowFlagSecure()
-        applyIdleOpacity()
-        if (shouldAutoCollapseToHandle()) {
-          scheduleAutoHide()
-        } else if (isShrunkToEdgeHandle && !isRecordingMode()) {
-          expandFromEdgeHandle()
-        }
-      }
-    }
-  }
-
-  fun updateRecorderState(state: RecorderState) {
-    val previousState = currentRecorderState
-    currentRecorderState = state
-    isInRecordingSession = state != RecorderState.IDLE
-
-    if (pillRootView != null) {
-      syncWindowFlagSecure()
-      bindPillState()
-      if (state != RecorderState.IDLE) {
-        if (previousState == RecorderState.IDLE && !isShrunkToEdgeHandle) {
-          shrinkToEdgeHandle()
-        } else {
-          applyIdleOpacity()
-          scheduleAutoHide()
-        }
-      } else {
-        applyIdleOpacity()
-        scheduleAutoHide()
-      }
-    }
-  }
-
-  fun updateElapsedTime(elapsedMs: Long) {
-    currentElapsedMs = elapsedMs
-    val tv = timerTextView
-    if (tv != null && !isShrunkToEdgeHandle && currentRecorderState != RecorderState.IDLE) {
-      updateTimerTextInPlace(tv, elapsedMs)
-    }
-  }
+    get() = currentSettings.floatingControls.keepEdgeHandleWhileRecording
 
   fun showOverlay(): Boolean {
     if (!Settings.canDrawOverlays(context)) {
-      onControlsVisibilityChanged?.invoke(false)
+      RecordingStateHolder.setFloatingControlsVisible(false)
       return false
     }
     if (pillRootView != null) {
       themedContext = createOverlayThemedContext(context)
-      onControlsVisibilityChanged?.invoke(true)
+      RecordingStateHolder.setFloatingControlsVisible(true)
       reTintOverlayViews()
       applyIdleOpacity()
       scheduleAutoHide()
@@ -229,7 +247,8 @@ class FloatingControlsController(
     return try {
       themedContext = createOverlayThemedContext(context)
       attachPillWindow()
-      onControlsVisibilityChanged?.invoke(true)
+      RecordingStateHolder.setFloatingControlsVisible(true)
+      ScreenRecorderTileService.requestTileUpdate(context)
       scheduleAutoHide()
       true
     } catch (t: Throwable) {
@@ -240,8 +259,11 @@ class FloatingControlsController(
   }
 
   /**
-   * Called when the user taps Start on the expanded pill or when recording starts while controls
-   * are active and "Keep edge handle while recording" is enabled.
+   * Called when the user taps Start on the expanded pill (or when recording starts while controls
+   * were open and "Keep edge handle while recording" is enabled):
+   * - Ensures the overlay window is attached.
+   * - Applies [WindowManager.LayoutParams.FLAG_SECURE] only if "Hide controls from video (experimental)" is on.
+   * - Collapses the pill into the 4dp x 48dp, 60% opacity edge handle on the side it was snapped to.
    */
   fun collapseToEdgeHandleForRecording(): Boolean {
     if (!Settings.canDrawOverlays(context)) {
@@ -265,7 +287,9 @@ class FloatingControlsController(
   }
 
   /**
-   * Restores idle pill after recording stops.
+   * Called when recording stops (or consent is cancelled) and the floating controls were open
+   * beforehand: clears [WindowManager.LayoutParams.FLAG_SECURE], binds the idle buttons
+   * (Start, Settings, Close), and expands back to the normal idle pill.
    */
   fun restoreIdlePillAfterRecording(): Boolean {
     if (!Settings.canDrawOverlays(context)) {
@@ -286,7 +310,8 @@ class FloatingControlsController(
       updateViewLayoutSafely(pillRootView, pillLayoutParams)
       scheduleAutoHide()
     }
-    onControlsVisibilityChanged?.invoke(true)
+    RecordingStateHolder.setFloatingControlsVisible(true)
+    ScreenRecorderTileService.requestTileUpdate(context)
     return true
   }
 
@@ -322,7 +347,8 @@ class FloatingControlsController(
         } catch (_: Throwable) {}
       }
     }
-    onControlsVisibilityChanged?.invoke(false)
+    RecordingStateHolder.setFloatingControlsVisible(false)
+    ScreenRecorderTileService.requestTileUpdate(context)
   }
 
   fun onConfigurationChanged(newConfig: Configuration) {
@@ -378,6 +404,11 @@ class FloatingControlsController(
 
   fun destroy() {
     removeOverlayCompletely()
+    settingsJob?.cancel()
+    settingsJob = null
+    recorderStateJob?.cancel()
+    recorderStateJob = null
+    scope.cancel()
   }
 
   private fun isRecordingMode(): Boolean {
@@ -385,11 +416,11 @@ class FloatingControlsController(
   }
 
   private fun shouldApplyFlagSecure(): Boolean {
-    return isRecordingMode() && currentSnapshot.hideControlsFromVideo
+    return isRecordingMode() && currentSettings.floatingControls.hideControlsFromVideo
   }
 
   private fun shouldAutoCollapseToHandle(): Boolean {
-    return isRecordingMode() || currentSnapshot.floatingControlsAutoHide
+    return isRecordingMode() || currentSettings.floatingControls.autoHide
   }
 
   private fun syncWindowFlagSecure() {
@@ -508,7 +539,7 @@ class FloatingControlsController(
   @SuppressLint("ClickableViewAccessibility")
   private fun attachPillWindow() {
     val palette = resolvePalette()
-    val sizeSpec = resolveSizeSpec(currentSnapshot.floatingControlsSize)
+    val sizeSpec = resolveSizeSpec(currentSettings.floatingControls.size)
     val (screenW, screenH) = getScreenDimensions()
     val landscape = isLandscape(themedContext.resources.configuration)
     val (savedXFrac, savedYFrac) = loadSavedPositionFractions(landscape)
@@ -647,6 +678,7 @@ class FloatingControlsController(
     }
 
     applyIdleOpacity()
+
     windowManager.addView(rootContainer, params)
   }
 
@@ -753,7 +785,7 @@ class FloatingControlsController(
       RecorderState.RECORDING -> {
         dismissSettingsPanel()
         tv.visibility = View.VISIBLE
-        updateTimerTextInPlace(tv, currentElapsedMs)
+        updateTimerTextInPlace(tv, RecordingStateHolder.elapsedTimeMs.value)
         if (!isShrunkToEdgeHandle) {
           mainHandler.postDelayed(timerTickRunnable, TIMER_TICK_MS)
         }
@@ -789,6 +821,7 @@ class FloatingControlsController(
           onStopRequested()
         }
 
+        // Button 3 hidden during recording
         btn3.visibility = View.GONE
         btn3.setOnClickListener(null)
       }
@@ -796,7 +829,7 @@ class FloatingControlsController(
       RecorderState.PAUSED -> {
         dismissSettingsPanel()
         tv.visibility = View.VISIBLE
-        updateTimerTextInPlace(tv, currentElapsedMs)
+        updateTimerTextInPlace(tv, RecordingStateHolder.elapsedTimeMs.value)
 
         // Button 1: Resume (filled with colorSecondaryContainer, icon in colorOnSecondaryContainer)
         btn1.visibility = View.VISIBLE
@@ -996,27 +1029,22 @@ class FloatingControlsController(
     val centerX = params.x + viewW / 2
     isDockedLeft = centerX < screenW / 2
 
-    if (currentSnapshot.floatingControlsEdgeSnapping || isRecordingMode()) {
+    if (currentSettings.floatingControls.edgeSnapping || isRecordingMode()) {
       val targetX = if (isDockedLeft) minX else maxX
       val startX = params.x
       snapAnimator?.cancel()
-      if (currentSnapshot.isGamingMode) {
-        params.x = targetX
-        updateViewLayoutSafely(root, params)
-      } else {
-        snapAnimator =
-          ValueAnimator.ofInt(startX, targetX).apply {
-            duration = SNAP_ANIMATION_MS
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { anim ->
-              val p = pillLayoutParams ?: return@addUpdateListener
-              val r = pillRootView ?: return@addUpdateListener
-              p.x = anim.animatedValue as Int
-              updateViewLayoutSafely(r, p)
-            }
-            start()
+      snapAnimator =
+        ValueAnimator.ofInt(startX, targetX).apply {
+          duration = SNAP_ANIMATION_MS
+          interpolator = DecelerateInterpolator()
+          addUpdateListener { anim ->
+            val p = pillLayoutParams ?: return@addUpdateListener
+            val r = pillRootView ?: return@addUpdateListener
+            p.x = anim.animatedValue as Int
+            updateViewLayoutSafely(r, p)
           }
-      }
+          start()
+        }
       savePositionFractions(
         isLandscape = isLandscape(themedContext.resources.configuration),
         xFrac = if (maxX > minX) (targetX - minX).toFloat() / (maxX - minX).toFloat() else 1f,
@@ -1080,7 +1108,7 @@ class FloatingControlsController(
       val maxX = (screenW - pillW - margin).coerceAtLeast(margin)
       val maxY = (screenH - pillH - dpToPx(48)).coerceAtLeast(margin)
       params.x =
-        if (currentSnapshot.floatingControlsEdgeSnapping || isRecordingMode()) {
+        if (currentSettings.floatingControls.edgeSnapping || isRecordingMode()) {
           if (isDockedLeft) margin else maxX
         } else {
           (savedXFrac * maxX).roundToInt().coerceIn(margin, maxX)
@@ -1089,7 +1117,7 @@ class FloatingControlsController(
     }
 
     if (currentRecorderState != RecorderState.IDLE) {
-      timerTextView?.let { updateTimerTextInPlace(it, currentElapsedMs) }
+      timerTextView?.let { updateTimerTextInPlace(it, RecordingStateHolder.elapsedTimeMs.value) }
       if (currentRecorderState == RecorderState.RECORDING) {
         mainHandler.removeCallbacks(timerTickRunnable)
         mainHandler.postDelayed(timerTickRunnable, TIMER_TICK_MS)
@@ -1119,7 +1147,7 @@ class FloatingControlsController(
       root.alpha = 1.0f
       return
     }
-    val pct = currentSnapshot.floatingControlsOpacityPercent.coerceIn(20, 100)
+    val pct = currentSettings.floatingControls.opacityPercent.coerceIn(20, 100)
     root.alpha = pct / 100f
   }
 
@@ -1172,7 +1200,7 @@ class FloatingControlsController(
     val (resRow, resValueTv) =
       createQuickSettingRow(
         label = "Resolution",
-        initialValue = currentSnapshot.resolution,
+        initialValue = currentSettings.video.resolution,
         palette = palette,
         onClick = { cycleResolutionOption() },
       )
@@ -1183,7 +1211,7 @@ class FloatingControlsController(
     val (fpsRow, fpsValueTv) =
       createQuickSettingRow(
         label = "Frame rate",
-        initialValue = "${currentSnapshot.fps} fps",
+        initialValue = "${currentSettings.video.fps} fps",
         palette = palette,
         onClick = { cycleFpsOption() },
       )
@@ -1194,7 +1222,7 @@ class FloatingControlsController(
     val (audioRow, audioValueTv) =
       createQuickSettingRow(
         label = "Audio source",
-        initialValue = currentSnapshot.audioSource,
+        initialValue = currentSettings.audio.source,
         palette = palette,
         onClick = { cycleAudioSourceOption() },
       )
@@ -1241,10 +1269,61 @@ class FloatingControlsController(
       ),
     )
 
-    val pParams = calculatePanelLayoutParams(panelWidth)
-    panelLayoutParams = pParams
-    panelRootView = panel
-    windowManager.addView(panel, pParams)
+    val pillParams = pillLayoutParams ?: return
+    val pillView = pillRootView ?: return
+    val (screenW, screenH) = getScreenDimensions()
+    val pillW = pillView.width.takeIf { it > 0 } ?: dpToPx(156)
+    val pillH = pillView.height.takeIf { it > 0 } ?: dpToPx(56)
+    val margin = dpToPx(8)
+    val estPanelH = dpToPx(210)
+
+    val panelX =
+      (pillParams.x + (pillW - panelWidth) / 2).coerceIn(
+        margin,
+        (screenW - panelWidth - margin).coerceAtLeast(margin),
+      )
+    val spaceBelow = screenH - (pillParams.y + pillH)
+    val panelY =
+      if (spaceBelow >= estPanelH + margin) {
+        pillParams.y + pillH + dpToPx(8)
+      } else {
+        (pillParams.y - estPanelH - dpToPx(8)).coerceAtLeast(margin)
+      }
+
+    var flags =
+      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+        WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+    if (shouldApplyFlagSecure()) {
+      flags = flags or WindowManager.LayoutParams.FLAG_SECURE
+    }
+
+    val panelParams =
+      WindowManager.LayoutParams(
+        panelWidth,
+        WindowManager.LayoutParams.WRAP_CONTENT,
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+        flags,
+        PixelFormat.TRANSLUCENT,
+      ).apply {
+        gravity = Gravity.TOP or Gravity.START
+        x = panelX
+        y = panelY
+      }
+
+    try {
+      windowManager.addView(panel, panelParams)
+      panelRootView = panel
+      panelLayoutParams = panelParams
+    } catch (_: Throwable) {
+      panelRootView = null
+      panelLayoutParams = null
+      panelRowViews.clear()
+      panelLabelViews.clear()
+      panelDividerView = null
+      panelMoreSettingsView = null
+    }
   }
 
   private fun dismissSettingsPanel() {
@@ -1259,51 +1338,13 @@ class FloatingControlsController(
     panelDividerView = null
     panelMoreSettingsView = null
     try {
-      windowManager.removeView(panel)
-    } catch (_: Throwable) {}
+      windowManager.removeViewImmediate(panel)
+    } catch (_: Throwable) {
+      try {
+        windowManager.removeView(panel)
+      } catch (_: Throwable) {}
+    }
     applyIdleOpacity()
-  }
-
-  private fun calculatePanelLayoutParams(panelWidthPx: Int): WindowManager.LayoutParams {
-    val pillParams = pillLayoutParams ?: WindowManager.LayoutParams()
-    val (screenW, screenH) = getScreenDimensions()
-    val margin = dpToPx(8)
-    val pillW = pillContentLayout?.measuredWidth?.takeIf { it > 0 } ?: dpToPx(156)
-    val pillH = pillContentLayout?.measuredHeight?.takeIf { it > 0 } ?: dpToPx(56)
-    val estPanelH = dpToPx(210)
-
-    val targetX =
-      (pillParams.x + (pillW - panelWidthPx) / 2).coerceIn(
-        margin,
-        (screenW - panelWidthPx - margin).coerceAtLeast(margin),
-      )
-    val spaceBelow = screenH - (pillParams.y + pillH)
-    val targetY =
-      if (spaceBelow >= estPanelH + margin) {
-        pillParams.y + pillH + dpToPx(8)
-      } else {
-        (pillParams.y - estPanelH - dpToPx(8)).coerceAtLeast(margin)
-      }
-
-    var windowFlags =
-      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-        WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH or
-        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
-    if (shouldApplyFlagSecure()) {
-      windowFlags = windowFlags or WindowManager.LayoutParams.FLAG_SECURE
-    }
-
-    return WindowManager.LayoutParams(
-      panelWidthPx,
-      WindowManager.LayoutParams.WRAP_CONTENT,
-      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-      windowFlags,
-      PixelFormat.TRANSLUCENT,
-    ).apply {
-      gravity = Gravity.TOP or Gravity.START
-      x = targetX
-      y = targetY
-    }
   }
 
   private fun createQuickSettingRow(
@@ -1316,9 +1357,7 @@ class FloatingControlsController(
       LinearLayout(themedContext).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        val padH = dpToPx(8)
-        val padV = dpToPx(8)
-        setPadding(padH, padV, padH, padV)
+        setPadding(dpToPx(8), dpToPx(8), dpToPx(8), dpToPx(8))
         background =
           createRoundedRowRipple(palette.colorControlHighlight, palette.colorSurfaceContainerHigh)
         setOnClickListener { onClick() }
@@ -1330,32 +1369,34 @@ class FloatingControlsController(
         text = label
         setTextColor(palette.colorOnSurface)
         setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-        typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+        maxLines = 1
       }
     panelLabelViews.add(labelTv)
+
+    val valueTv =
+      TextView(themedContext).apply {
+        text = initialValue
+        setTextColor(palette.colorOnSecondaryContainer)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        gravity = Gravity.CENTER
+        maxLines = 1
+        setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
+        background = createSelectedChipDrawable(palette)
+      }
+
     row.addView(
       labelTv,
       LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
     )
-
-    val valueChip =
-      TextView(themedContext).apply {
-        text = initialValue
-        setTextColor(palette.colorOnSecondaryContainer)
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-        setPadding(dpToPx(10), dpToPx(4), dpToPx(10), dpToPx(4))
-        background = createSelectedChipDrawable(palette)
-      }
     row.addView(
-      valueChip,
+      valueTv,
       LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.WRAP_CONTENT,
         LinearLayout.LayoutParams.WRAP_CONTENT,
-      ),
+      ).apply { marginStart = dpToPx(8) },
     )
-
-    return row to valueChip
+    return row to valueTv
   }
 
   private fun createRoundedRowRipple(rippleColor: Int, maskColor: Int): RippleDrawable {
@@ -1370,49 +1411,69 @@ class FloatingControlsController(
 
   private fun cycleResolutionOption() {
     val supported =
-      currentSnapshot.probedResolutions.ifEmpty {
+      CapabilityProbe.getDeviceSupportedResolutions(context).ifEmpty {
         listOf("720p", "1080p")
       }
-    val current = currentSnapshot.resolution
+    val current = currentSettings.video.resolution
     val currentIdx = supported.indexOfFirst { it.equals(current, ignoreCase = true) }
     val nextRes = supported[(currentIdx + 1).mod(supported.size)]
-    val nextFps = currentSnapshot.fps
+    val supportedFpsForNext =
+      CapabilityProbe.getSupportedFpsForResolution(context, nextRes).ifEmpty {
+        listOf(30, 60)
+      }
+    val nextFps =
+      if (currentSettings.video.fps in supportedFpsForNext) {
+        currentSettings.video.fps
+      } else {
+        supportedFpsForNext.maxOrNull() ?: 30
+      }
 
     panelResolutionValueView?.text = nextRes
     panelFpsValueView?.text = "$nextFps fps"
 
-    currentSnapshot = currentSnapshot.copy(resolution = nextRes, fps = nextFps)
-    onQuickSettingChanged?.invoke(nextRes, nextFps, currentSnapshot.audioSource)
+    scope.launch {
+      settingsRepository.updateVideoSettings {
+        it.copy(resolution = nextRes, fps = nextFps)
+      }
+    }
   }
 
   private fun cycleFpsOption() {
-    val supportedFps = listOf(24, 30, 60)
-    val currentFps = currentSnapshot.fps
+    val supportedFps =
+      CapabilityProbe.getSupportedFpsForResolution(context, currentSettings.video.resolution)
+        .ifEmpty { listOf(24, 30, 60) }
+    val currentFps = currentSettings.video.fps
     val currentIdx = supportedFps.indexOf(currentFps)
     val nextFps = supportedFps[(currentIdx + 1).mod(supportedFps.size)]
 
     panelFpsValueView?.text = "$nextFps fps"
 
-    currentSnapshot = currentSnapshot.copy(fps = nextFps)
-    onQuickSettingChanged?.invoke(currentSnapshot.resolution, nextFps, currentSnapshot.audioSource)
+    scope.launch {
+      settingsRepository.updateVideoSettings {
+        it.copy(fps = nextFps)
+      }
+    }
   }
 
   private fun cycleAudioSourceOption() {
-    val currentSource = currentSnapshot.audioSource
+    val currentSource = currentSettings.audio.source
     val currentIdx = AUDIO_SOURCES.indexOfFirst { it.equals(currentSource, ignoreCase = true) }
     val nextSource = AUDIO_SOURCES[(currentIdx + 1).mod(AUDIO_SOURCES.size)]
     val micImplicit = nextSource.contains("Mic", ignoreCase = true)
 
     panelAudioValueView?.text = nextSource
 
-    currentSnapshot = currentSnapshot.copy(audioSource = nextSource, micEnabled = micImplicit)
-    onQuickSettingChanged?.invoke(currentSnapshot.resolution, currentSnapshot.fps, nextSource)
+    scope.launch {
+      settingsRepository.updateAudioSettings {
+        it.copy(source = nextSource, micEnabled = micImplicit)
+      }
+    }
   }
 
   private fun refreshPanelValues() {
-    panelResolutionValueView?.text = currentSnapshot.resolution
-    panelFpsValueView?.text = "${currentSnapshot.fps} fps"
-    panelAudioValueView?.text = currentSnapshot.audioSource
+    panelResolutionValueView?.text = currentSettings.video.resolution
+    panelFpsValueView?.text = "${currentSettings.video.fps} fps"
+    panelAudioValueView?.text = currentSettings.audio.source
   }
 
   private fun openAppSettingsScreen() {
@@ -1438,30 +1499,28 @@ class FloatingControlsController(
   }
 
   private fun loadSavedPositionFractions(isLandscape: Boolean): Pair<Float, Float> {
-    return if (isLandscape) {
-      currentSnapshot.landscapeXFrac to currentSnapshot.landscapeYFrac
-    } else {
-      currentSnapshot.portraitXFrac to currentSnapshot.portraitYFrac
+    return try {
+      val prefs = context.getSharedPreferences(PREFS_POSITION, Context.MODE_PRIVATE)
+      val xKey = if (isLandscape) KEY_LANDSCAPE_X_FRAC else KEY_PORTRAIT_X_FRAC
+      val yKey = if (isLandscape) KEY_LANDSCAPE_Y_FRAC else KEY_PORTRAIT_Y_FRAC
+      val xFrac = prefs.getFloat(xKey, 1.0f).coerceIn(0f, 1f)
+      val yFrac = prefs.getFloat(yKey, 0.35f).coerceIn(0f, 1f)
+      xFrac to yFrac
+    } catch (_: Throwable) {
+      1.0f to 0.35f
     }
   }
 
   private fun savePositionFractions(isLandscape: Boolean, xFrac: Float, yFrac: Float) {
-    if (isLandscape) {
-      currentSnapshot = currentSnapshot.copy(landscapeXFrac = xFrac, landscapeYFrac = yFrac)
-    } else {
-      currentSnapshot = currentSnapshot.copy(portraitXFrac = xFrac, portraitYFrac = yFrac)
-    }
-    onPositionChanged?.invoke(
-      currentSnapshot.portraitXFrac,
-      currentSnapshot.portraitYFrac,
-      currentSnapshot.landscapeXFrac,
-      currentSnapshot.landscapeYFrac,
-    )
     try {
       val prefs = context.getSharedPreferences(PREFS_POSITION, Context.MODE_PRIVATE)
       val xKey = if (isLandscape) KEY_LANDSCAPE_X_FRAC else KEY_PORTRAIT_X_FRAC
       val yKey = if (isLandscape) KEY_LANDSCAPE_Y_FRAC else KEY_PORTRAIT_Y_FRAC
-      prefs.edit().putFloat(xKey, xFrac.coerceIn(0f, 1f)).putFloat(yKey, yFrac.coerceIn(0f, 1f)).apply()
+      prefs
+        .edit()
+        .putFloat(xKey, xFrac.coerceIn(0f, 1f))
+        .putFloat(yKey, yFrac.coerceIn(0f, 1f))
+        .apply()
     } catch (_: Throwable) {}
   }
 
@@ -1492,6 +1551,36 @@ class FloatingControlsController(
     val timerTextSp: Float,
   )
 
+  private fun resolveSizeSpec(sizeLabel: String): PillSizeSpec {
+    return when {
+      sizeLabel.equals("Small", ignoreCase = true) ||
+        sizeLabel.equals("Mini", ignoreCase = true) ->
+        PillSizeSpec(
+          buttonSizePx = dpToPx(34),
+          iconSizePx = dpToPx(18),
+          horizontalPaddingPx = dpToPx(6),
+          verticalPaddingPx = dpToPx(6),
+          timerTextSp = 12f,
+        )
+      sizeLabel.equals("Large", ignoreCase = true) ->
+        PillSizeSpec(
+          buttonSizePx = dpToPx(46),
+          iconSizePx = dpToPx(22),
+          horizontalPaddingPx = dpToPx(10),
+          verticalPaddingPx = dpToPx(10),
+          timerTextSp = 15f,
+        )
+      else ->
+        PillSizeSpec(
+          buttonSizePx = dpToPx(40),
+          iconSizePx = dpToPx(20),
+          horizontalPaddingPx = dpToPx(8),
+          verticalPaddingPx = dpToPx(8),
+          timerTextSp = 13.5f,
+        )
+    }
+  }
+
   private data class OverlayPalette(
     val colorPrimary: Int,
     val colorOnPrimary: Int,
@@ -1504,35 +1593,6 @@ class FloatingControlsController(
     val colorOnSurfaceVariant: Int,
     val colorControlHighlight: Int,
   )
-
-  private fun resolveSizeSpec(sizeSetting: String): PillSizeSpec {
-    return when (sizeSetting) {
-      "Compact" ->
-        PillSizeSpec(
-          buttonSizePx = dpToPx(36),
-          iconSizePx = dpToPx(20),
-          horizontalPaddingPx = dpToPx(8),
-          verticalPaddingPx = dpToPx(6),
-          timerTextSp = 13f,
-        )
-      "Large" ->
-        PillSizeSpec(
-          buttonSizePx = dpToPx(48),
-          iconSizePx = dpToPx(28),
-          horizontalPaddingPx = dpToPx(14),
-          verticalPaddingPx = dpToPx(10),
-          timerTextSp = 16f,
-        )
-      else ->
-        PillSizeSpec(
-          buttonSizePx = dpToPx(40),
-          iconSizePx = dpToPx(24),
-          horizontalPaddingPx = dpToPx(10),
-          verticalPaddingPx = dpToPx(8),
-          timerTextSp = 14f,
-        )
-    }
-  }
 
   private fun createOverlayThemedContext(
     baseContext: Context,

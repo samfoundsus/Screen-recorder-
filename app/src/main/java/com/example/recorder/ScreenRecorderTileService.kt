@@ -12,7 +12,6 @@ import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import com.example.R
 import com.example.domain.model.RecorderState
-import com.example.recorder.ipc.RecorderClient
 import com.example.ui.components.FormatUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -75,9 +74,6 @@ class ScreenRecorderTileService : TileService() {
 
   override fun onStartListening() {
     super.onStartListening()
-    try {
-      RecorderClient.getInstance(applicationContext).ensureConnected()
-    } catch (_: Throwable) {}
     syncTileWithCurrentState()
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     listeningScope = scope
@@ -122,12 +118,9 @@ class ScreenRecorderTileService : TileService() {
     val controlsVisible = RecordingStateHolder.floatingControlsVisible.value
 
     if (currentState != RecorderState.IDLE || countdown > 0) {
-      // Tapping while recording or counting down stops the recording directly via client IPC and service
+      // Tapping while recording or counting down stops the recording directly via the service
       try {
-        RecorderClient.getInstance(applicationContext).stop()
-      } catch (_: Throwable) {}
-      try {
-        startService(RecorderService.createStopIntent(applicationContext, "tile"))
+        startService(RecorderService.createStopIntent(applicationContext))
       } catch (_: Throwable) {
         RecordingStateHolder.setIdle()
       }
@@ -137,9 +130,6 @@ class ScreenRecorderTileService : TileService() {
 
     if (controlsVisible) {
       // Tapping the tile again while floating controls are visible and idle closes them
-      try {
-        RecorderClient.getInstance(applicationContext).closeControls()
-      } catch (_: Throwable) {}
       try {
         startService(RecorderService.createHideControlsIntent(applicationContext))
       } catch (_: Throwable) {

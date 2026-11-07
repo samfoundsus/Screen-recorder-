@@ -728,29 +728,9 @@ fun RecordingDetailsDialog(
       Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         DetailSpecRow("Name", "${item.title}.${item.container.lowercase()}")
         DetailSpecRow("Resolution", resolvedResolution)
-        val reqFps = metadata?.requestedFps ?: item.fps
-        val measuredFps = metadata?.measuredAvgFps
-        val recordedFpsText = when {
-          measuredFps != null && measuredFps > 0.0 -> {
-            val recordedFpsInt = Math.round(measuredFps).toInt()
-            if (reqFps != null && reqFps > 0) {
-              "Requested $reqFps fps · Recorded $recordedFpsInt fps average"
-            } else {
-              "Recorded $recordedFpsInt fps average"
-            }
-          }
-          resolvedFps != null && resolvedFps > 0 -> {
-            if (reqFps != null && reqFps > 0 && reqFps != resolvedFps) {
-              "Requested $reqFps fps · Recorded $resolvedFps fps average"
-            } else {
-              "$resolvedFps FPS"
-            }
-          }
-          else -> "Variable"
-        }
         DetailSpecRow(
           "Frame rate",
-          recordedFpsText,
+          if (resolvedFps != null && resolvedFps > 0) "$resolvedFps FPS" else "Variable",
         )
         DetailSpecRow(
           "Bitrate",

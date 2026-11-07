@@ -19,7 +19,6 @@ import com.example.domain.model.OptionProbeState
 import com.example.domain.repository.CapabilitiesProvider
 import com.example.domain.repository.SettingsRepository
 import com.example.recorder.RecordingStateHolder
-import com.example.util.DeviceUtils
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -66,7 +65,6 @@ object CapabilityProbe {
   private const val MIME_HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC
 
   private val hardwareProbeMutex = Mutex()
-  private val probeMemoryCache = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
 
   fun roundDown16(value: Int): Int = ((value / 16) * 16).coerceAtLeast(16)
 
@@ -120,16 +118,6 @@ object CapabilityProbe {
 
   fun findPreferredEncoderInfo(mimeType: String): MediaCodecInfo? {
     return findHardwareEncoders(mimeType).firstOrNull()
-  }
-
-  fun findAnyH264EncoderName(): String? {
-    val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-    for (info in list.codecInfos) {
-      if (info.isEncoder && info.supportedTypes.any { it.equals(MIME_AVC, ignoreCase = true) }) {
-        return info.name
-      }
-    }
-    return null
   }
 
   private fun getMaxHardwareEncoderDimensions(): Pair<Int, Int> {
@@ -422,7 +410,7 @@ object CapabilityProbe {
    */
   suspend fun probeResolutionAndFps(
     context: Context,
-    settingsRepository: SettingsRepository?,
+    settingsRepository: SettingsRepository,
     resolutionLabel: String,
     fps: Int,
     orientationLabel: String = "Auto",
@@ -453,7 +441,7 @@ object CapabilityProbe {
    * Uses DataStore cache keyed by codec + width + height + fps so each probe runs once per device.
    */
   suspend fun probeCombination(
-    settingsRepository: SettingsRepository?,
+    settingsRepository: SettingsRepository,
     width: Int,
     height: Int,
     fps: Int,
@@ -474,21 +462,16 @@ object CapabilityProbe {
       }
 
     for ((codecKey, mimeType) in codecOrder) {
-      val memKey = "${codecKey}_${alignedW}_${alignedH}_$fps"
-      val cached =
-        probeMemoryCache[memKey]
-          ?: settingsRepository?.getCachedProbeResult(codecKey, alignedW, alignedH, fps)
+      val cached = settingsRepository.getCachedProbeResult(codecKey, alignedW, alignedH, fps)
       val supported =
         if (cached != null) {
-          probeMemoryCache[memKey] = cached
           cached
         } else {
           val probed =
             hardwareProbeMutex.withLock {
               realProbeSingleCodec(mimeType, alignedW, alignedH, fps) != null
             }
-          probeMemoryCache[memKey] = probed
-          settingsRepository?.saveCachedProbeResult(codecKey, alignedW, alignedH, fps, probed)
+          settingsRepository.saveCachedProbeResult(codecKey, alignedW, alignedH, fps, probed)
           probed
         }
 
@@ -589,7 +572,7 @@ object CapabilityProbe {
    */
   suspend fun resolveSupportedEncoderSpec(
     context: Context,
-    settingsRepository: SettingsRepository?,
+    settingsRepository: SettingsRepository,
     requestedResolution: String,
     requestedFps: Int,
     orientationLabel: String,
@@ -610,6 +593,14 @@ object CapabilityProbe {
       )
     if (directMatch != null) {
       val encoderInfo = findPreferredEncoderInfo(directMatch.mimeType)
+      val configureFps =
+        computeSafeConfigureFps(
+          encoderInfo = encoderInfo,
+          mimeType = directMatch.mimeType,
+          width = directMatch.width,
+          height = directMatch.height,
+          requestedFps = requestedFps,
+        )
       val bitrateBps =
         computeClampedBitrateBps(
           width = directMatch.width,
@@ -623,56 +614,13 @@ object CapabilityProbe {
         width = directMatch.width,
         height = directMatch.height,
         fps = requestedFps,
-        configureFps = requestedFps,
+        configureFps = configureFps,
         bitrateBps = bitrateBps,
         codecLabel = directMatch.codecLabel,
         mimeType = directMatch.mimeType,
         encoderName = encoderInfo?.name,
         fellBackFromSaved = false,
       )
-    }
-
-    if (DeviceUtils.isEmulator()) {
-      // On an emulator, if direct match fails, try the highest supported fps for the requested resolution
-      val candidateFpsList = getSupportedFpsForResolution(context, normRes).sortedDescending()
-      for (candidateFps in candidateFpsList) {
-        if (candidateFps == requestedFps) continue
-        val match =
-          probeResolutionAndFps(
-            context = context,
-            settingsRepository = settingsRepository,
-            resolutionLabel = normRes,
-            fps = candidateFps,
-            orientationLabel = orientationLabel,
-            preferredCodecLabel = preferredCodecLabel,
-          )
-        if (match != null) {
-          val encoderInfo = findPreferredEncoderInfo(match.mimeType)
-          val bitrateBps =
-            computeClampedBitrateBps(
-              width = match.width,
-              height = match.height,
-              fps = candidateFps,
-              mimeType = match.mimeType,
-              customBitrateMbps = customBitrateMbps,
-            )
-          if (notifyAndPersistOnFallback) {
-            applyFallbackSelection(context, settingsRepository, normRes, candidateFps, match.codecLabel, reason = "device limit")
-          }
-          return ResolvedEncoderSpec(
-            resolutionLabel = normRes,
-            width = match.width,
-            height = match.height,
-            fps = candidateFps,
-            configureFps = candidateFps,
-            bitrateBps = bitrateBps,
-            codecLabel = match.codecLabel,
-            mimeType = match.mimeType,
-            encoderName = encoderInfo?.name,
-            fellBackFromSaved = true,
-          )
-        }
-      }
     }
 
     // Step 1: Fall back to nearest supported frame rate at the requested resolution
@@ -694,6 +642,14 @@ object CapabilityProbe {
         )
       if (match != null) {
         val encoderInfo = findPreferredEncoderInfo(match.mimeType)
+        val configureFps =
+          computeSafeConfigureFps(
+            encoderInfo = encoderInfo,
+            mimeType = match.mimeType,
+            width = match.width,
+            height = match.height,
+            requestedFps = candidateFps,
+          )
         val bitrateBps =
           computeClampedBitrateBps(
             width = match.width,
@@ -703,14 +659,14 @@ object CapabilityProbe {
             customBitrateMbps = customBitrateMbps,
           )
         if (notifyAndPersistOnFallback) {
-          applyFallbackSelection(context, settingsRepository, normRes, candidateFps, match.codecLabel)
+          applyFallbackSelection(settingsRepository, normRes, candidateFps, match.codecLabel)
         }
         return ResolvedEncoderSpec(
           resolutionLabel = normRes,
           width = match.width,
           height = match.height,
           fps = candidateFps,
-          configureFps = candidateFps,
+          configureFps = configureFps,
           bitrateBps = bitrateBps,
           codecLabel = match.codecLabel,
           mimeType = match.mimeType,
@@ -733,12 +689,8 @@ object CapabilityProbe {
 
     for (candidateRes in sortedResCandidates) {
       val candidateFpsList =
-        if (DeviceUtils.isEmulator()) {
-          getSupportedFpsForResolution(context, candidateRes).sortedDescending()
-        } else {
-          getSupportedFpsForResolution(context, candidateRes)
-            .sortedWith(compareBy<Int> { abs(it - requestedFps) }.thenByDescending { it })
-        }
+        getSupportedFpsForResolution(context, candidateRes)
+          .sortedWith(compareBy<Int> { abs(it - requestedFps) }.thenByDescending { it })
       for (candidateFps in candidateFpsList) {
         val match =
           probeResolutionAndFps(
@@ -751,6 +703,14 @@ object CapabilityProbe {
           )
         if (match != null) {
           val encoderInfo = findPreferredEncoderInfo(match.mimeType)
+          val configureFps =
+            computeSafeConfigureFps(
+              encoderInfo = encoderInfo,
+              mimeType = match.mimeType,
+              width = match.width,
+              height = match.height,
+              requestedFps = candidateFps,
+            )
           val bitrateBps =
             computeClampedBitrateBps(
               width = match.width,
@@ -761,7 +721,6 @@ object CapabilityProbe {
             )
           if (notifyAndPersistOnFallback) {
             applyFallbackSelection(
-              context,
               settingsRepository,
               candidateRes,
               candidateFps,
@@ -773,7 +732,7 @@ object CapabilityProbe {
             width = match.width,
             height = match.height,
             fps = candidateFps,
-            configureFps = candidateFps,
+            configureFps = configureFps,
             bitrateBps = bitrateBps,
             codecLabel = match.codecLabel,
             mimeType = match.mimeType,
@@ -786,9 +745,9 @@ object CapabilityProbe {
 
     // Ultimate safe fallback if all probes failed
     val (fbW, fbH) = compute16AlignedDimensions(context, "720p", orientationLabel)
-    val fbBitrate = if (DeviceUtils.isEmulator()) 4_000_000 else computeClampedBitrateBps(fbW, fbH, 30, MIME_AVC, customBitrateMbps)
+    val fbBitrate = computeClampedBitrateBps(fbW, fbH, 30, MIME_AVC, customBitrateMbps)
     if (notifyAndPersistOnFallback) {
-      applyFallbackSelection(context, settingsRepository, "720p", 30, "H.264")
+      applyFallbackSelection(settingsRepository, "720p", 30, "H.264")
     }
     return ResolvedEncoderSpec(
       resolutionLabel = "720p",
@@ -799,30 +758,28 @@ object CapabilityProbe {
       bitrateBps = fbBitrate,
       codecLabel = "H.264",
       mimeType = MIME_AVC,
-      encoderName = findPreferredEncoderInfo(MIME_AVC)?.name ?: findAnyH264EncoderName(),
+      encoderName = findPreferredEncoderInfo(MIME_AVC)?.name,
       fellBackFromSaved = true,
     )
   }
 
   private suspend fun applyFallbackSelection(
-    context: Context,
-    settingsRepository: SettingsRepository?,
+    settingsRepository: SettingsRepository,
     fallbackResolution: String,
     fallbackFps: Int,
     codecLabel: String,
-    reason: String = "device limit",
   ) {
     val cleanCodec = if (codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)"
-    settingsRepository?.updateVideoSettings { current ->
+    settingsRepository.updateVideoSettings { current ->
       current.copy(
         resolution = fallbackResolution,
         fps = fallbackFps,
         codec = cleanCodec,
       )
     }
-    val msg = "Recording at $fallbackResolution · $fallbackFps fps ($reason)"
-    RecordingStateHolder.showSnackbarMessage(msg)
-    RecordingStateHolder.setPendingSnackbarMessage(context, msg)
+    RecordingStateHolder.showSnackbarMessage(
+      "Recording at $fallbackResolution · $fallbackFps fps (device limit)"
+    )
   }
 
   fun isNoiseSuppressionSupported(): Boolean {

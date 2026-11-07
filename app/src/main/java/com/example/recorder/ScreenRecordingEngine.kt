@@ -58,7 +58,7 @@ import android.view.Surface
 import android.view.WindowManager
 import com.example.BuildConfig
 import com.example.data.capabilities.CapabilityProbe
-import com.example.util.DeviceUtils
+import com.example.data.repository.DataStoreSettingsRepository
 import com.example.data.repository.RecordingMediaCache
 import com.example.domain.model.VideoMetadata
 import java.io.File
@@ -72,7 +72,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 
@@ -88,7 +87,6 @@ data class RecordingSessionConfig(
   val micEnabled: Boolean,
   val noiseSuppression: Boolean,
   val audioChannelMode: String,
-  val isGamingMode: Boolean = false,
 ) {
   val wantsInternalAudio: Boolean
     get() =
@@ -123,15 +121,6 @@ class ScreenRecordingEngine(
     const val TAG = "ScreenRecorderEngine"
     const val MIN_START_FREE_BYTES: Long = 300L * 1024L * 1024L // 300 MB
     const val MIN_RECORDING_FREE_BYTES: Long = 150L * 1024L * 1024L // 150 MB
-    const val EMULATOR_MIN_START_FREE_BYTES: Long = 50L * 1024L * 1024L // 50 MB
-    const val EMULATOR_MIN_RECORDING_FREE_BYTES: Long = 20L * 1024L * 1024L // 20 MB
-
-    fun getMinimumStorageStartBytes(context: Context): Long =
-      if (DeviceUtils.isEmulator()) EMULATOR_MIN_START_FREE_BYTES else MIN_START_FREE_BYTES
-
-    fun getMinimumStorageStopBytes(context: Context): Long =
-      if (DeviceUtils.isEmulator()) EMULATOR_MIN_RECORDING_FREE_BYTES else MIN_RECORDING_FREE_BYTES
-
     const val INTERRUPTED_PREVIOUS_RECORDING_SNACKBAR =
       "A previous recording was interrupted and could not be saved."
 
@@ -159,7 +148,6 @@ class ScreenRecordingEngine(
 
     /**
      * Checks available free space on the external Movies volume using [StorageManager] and [StatFs].
-     * On an emulator, treats unreliable storage values (zero or negative) as "enough space".
      */
     fun getAvailableStorageBytes(context: Context): Long {
       val targetDir: File =
@@ -172,7 +160,7 @@ class ScreenRecordingEngine(
           context.filesDir
         }
 
-      val rawBytes = try {
+      return try {
         val statFs = StatFs(targetDir.absolutePath)
         val statAvailable = statFs.availableBytes
         if (statAvailable > 0L) {
@@ -190,20 +178,13 @@ class ScreenRecordingEngine(
         try {
           StatFs(context.filesDir.absolutePath).availableBytes
         } catch (_: Throwable) {
-          if (DeviceUtils.isEmulator()) Long.MAX_VALUE else 0L
+          Long.MAX_VALUE
         }
-      }
-
-      return if (DeviceUtils.isEmulator() && rawBytes <= 0L) {
-        // Treat unreliable storage values (zero or negative from StatFs) as "enough space"
-        Long.MAX_VALUE
-      } else {
-        rawBytes
       }
     }
 
     fun hasEnoughStorageToStart(context: Context): Boolean {
-      return getAvailableStorageBytes(context) >= getMinimumStorageStartBytes(context)
+      return getAvailableStorageBytes(context) >= MIN_START_FREE_BYTES
     }
 
     /**
@@ -317,8 +298,6 @@ class ScreenRecordingEngine(
   private var actualWidth = 1072
   private var actualHeight = 1920
   private var actualFps = 60
-  private var lastFrameCheckRealtimeMs: Long = 0L
-  private var framesSinceLastFrameCheck: Int = 0
   private var actualBitrateBps = 12_000_000
   private var actualVideoMime = MediaFormat.MIMETYPE_VIDEO_AVC
   private var actualCodecLabel = "AVC (H.264)"
@@ -326,8 +305,7 @@ class ScreenRecordingEngine(
   fun start() {
     try {
       if (!hasEnoughStorageToStart(context)) {
-        val minMb = getMinimumStorageStartBytes(context) / (1024 * 1024)
-        throw IOException("Not enough storage space to start recording (at least $minMb MB required).")
+        throw IOException("Not enough storage space to start recording (at least 300 MB required).")
       }
 
       prepareOutputMediaStoreUri()
@@ -395,21 +373,20 @@ class ScreenRecordingEngine(
   private fun notifyFatalEngineError(t: Throwable) {
     if (!isRunning.get() || isStopping.get()) return
     if (!errorDispatched.compareAndSet(false, true)) return
-    val stopThreshold = getMinimumStorageStopBytes(context)
     val isDiskFullOrIo =
-      (t is IOException &&
-        ((t.message?.contains("ENOSPC", ignoreCase = true) == true) ||
-          (t.message?.contains("No space", ignoreCase = true) == true))) ||
-        getAvailableStorageBytes(context) < stopThreshold
+      t is IOException ||
+        t.cause is IOException ||
+        (t.message?.contains("ENOSPC", ignoreCase = true) == true) ||
+        (t.message?.contains("No space", ignoreCase = true) == true) ||
+        getAvailableStorageBytes(context) < MIN_RECORDING_FREE_BYTES
 
     val reason =
       if (isDiskFullOrIo) {
-        val msg = t.message ?: "Storage free space below ${stopThreshold / (1024 * 1024)} MB threshold"
-        StopReason(StopReasonType.LOW_STORAGE, msg)
+        StopReason.STORAGE_ALMOST_FULL
       } else {
-        StopReason.fromThrowable(t)
+        StopReason.INTERRUPTED
       }
-    debugLog("Fatal engine error detected (${reason.formattedReason()}): ${t.message}", t)
+    debugLog("Fatal engine error detected ($reason): ${t.message}", t)
     onEngineError?.invoke(reason)
   }
 
@@ -548,7 +525,6 @@ class ScreenRecordingEngine(
               hasAudio = recordedAudioTrack,
               audioChannelMode = finalChannelLabel,
               noiseSuppression = finalNoiseSuppression,
-              requestedFps = config.fps,
             ),
         )
         val values =
@@ -629,46 +605,18 @@ class ScreenRecordingEngine(
     }
   }
 
-  private data class FallbackVideoCandidate(
-    val label: String,
-    val width: Int,
-    val height: Int,
-    val fps: Int,
-    val bitrateBps: Int,
-    val mimeType: String = MediaFormat.MIMETYPE_VIDEO_AVC,
-    val codecLabel: String = "AVC (H.264)",
-    val preferredEncoderName: String? = null,
-  )
-
-  private val fallbackCandidates = mutableListOf<FallbackVideoCandidate>()
-  @Volatile private var currentFallbackIndex: Int = 0
-  @Volatile private var firstVideoBufferDrained: Boolean = false
-  @Volatile private var firstBufferTimeoutLogged: Boolean = false
-  @Volatile private var videoDrainStartRealtimeMs: Long = 0L
-  @Volatile private var currentDensityDpi: Int = 160
-  @Volatile private var currentDisplayRefreshRateHz: Int = 60
-  @Volatile private var activeEncoderName: String = "unknown"
-  @Volatile private var appliedKeyFrameRate: Int = 60
-
   private fun prepareVideoEncoderAndVirtualDisplay() {
     val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
     val metrics = DisplayMetrics()
     @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(metrics)
     val densityDpi = metrics.densityDpi.coerceAtLeast(160)
-    currentDensityDpi = densityDpi
-    currentDisplayRefreshRateHz = CapabilityProbe.getDisplayRefreshRateHz(context)
 
-    val isLandscape = config.orientationLabel.equals("Landscape", ignoreCase = true) ||
-      (config.orientationLabel.equals("Auto", ignoreCase = true) && metrics.widthPixels > metrics.heightPixels)
-    val displayShort = min(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(360)
-    val displayLong = max(metrics.widthPixels, metrics.heightPixels).coerceAtLeast(640)
-    val aspect = displayLong.toFloat() / displayShort.toFloat()
-
+    val settingsRepository = DataStoreSettingsRepository(context.applicationContext)
     val resolvedSpec =
-      runBlocking(Dispatchers.Default) {
+      runBlocking(Dispatchers.IO) {
         CapabilityProbe.resolveSupportedEncoderSpec(
           context = context.applicationContext,
-          settingsRepository = null,
+          settingsRepository = settingsRepository,
           requestedResolution = config.resolutionLabel,
           requestedFps = config.fps,
           orientationLabel = config.orientationLabel,
@@ -678,177 +626,108 @@ class ScreenRecordingEngine(
         )
       }
 
-    fun makeScaledCandidate(shortDim: Int, targetFps: Int, targetBitrate: Int, label: String): FallbackVideoCandidate {
-      val shortAligned = CapabilityProbe.roundDown16(shortDim)
-      val longAligned = CapabilityProbe.roundDown16((shortDim * aspect).roundToInt())
-      val (w, h) = if (isLandscape) longAligned to shortAligned else shortAligned to longAligned
-      return FallbackVideoCandidate(
-        label = label,
-        width = w,
-        height = h,
-        fps = targetFps,
-        bitrateBps = targetBitrate,
-        mimeType = MediaFormat.MIMETYPE_VIDEO_AVC,
-        codecLabel = "AVC (H.264)",
-      )
-    }
+    // Width and height are strictly multiples of 16 (rounded down) and remain fixed for the whole recording
+    actualWidth = CapabilityProbe.roundDown16(resolvedSpec.width)
+    actualHeight = CapabilityProbe.roundDown16(resolvedSpec.height)
+    actualFps = resolvedSpec.fps
+    val configureFps = resolvedSpec.configureFps
+    actualBitrateBps = resolvedSpec.bitrateBps
+    actualVideoMime = resolvedSpec.mimeType
+    actualCodecLabel =
+      if (resolvedSpec.codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)"
 
-    fallbackCandidates.clear()
-    // Step 0: Resolved/requested settings
-    fallbackCandidates.add(
-      FallbackVideoCandidate(
-        label = "${resolvedSpec.resolutionLabel} ${resolvedSpec.fps}fps",
-        width = CapabilityProbe.roundDown16(resolvedSpec.width),
-        height = CapabilityProbe.roundDown16(resolvedSpec.height),
-        fps = resolvedSpec.fps,
-        bitrateBps = resolvedSpec.bitrateBps,
-        mimeType = resolvedSpec.mimeType,
-        codecLabel = if (resolvedSpec.codecLabel.startsWith("HEVC")) "HEVC (H.265)" else "AVC (H.264)",
-        preferredEncoderName = resolvedSpec.encoderName,
-      )
-    )
-    // First try scaling resolution while keeping the requested/resolved FPS before lowering FPS
-    if (resolvedSpec.fps > 30) {
-      fallbackCandidates.add(makeScaledCandidate(1072, resolvedSpec.fps, max(resolvedSpec.bitrateBps, 6_000_000), "1080p ${resolvedSpec.fps}fps"))
-      fallbackCandidates.add(makeScaledCandidate(720, resolvedSpec.fps, min(resolvedSpec.bitrateBps, 6_000_000), "720p ${resolvedSpec.fps}fps"))
-      fallbackCandidates.add(makeScaledCandidate(480, resolvedSpec.fps, min(resolvedSpec.bitrateBps, 4_000_000), "480p ${resolvedSpec.fps}fps"))
-    }
-    // Only lower FPS if configure/start fails for all resolutions at the requested FPS
-    fallbackCandidates.add(makeScaledCandidate(1072, 30, 6_000_000, "1080p 30fps"))
-    fallbackCandidates.add(makeScaledCandidate(720, 30, 3_000_000, "720p 30fps"))
-    fallbackCandidates.add(makeScaledCandidate(480, 30, 1_500_000, "480p 30fps"))
-
-    var started = false
-    var lastError: Throwable? = null
-    for (i in fallbackCandidates.indices) {
-      val candidate = fallbackCandidates[i]
-      try {
-        actualWidth = candidate.width
-        actualHeight = candidate.height
-        actualFps = candidate.fps
-        actualBitrateBps = candidate.bitrateBps
-        actualVideoMime = candidate.mimeType
-        actualCodecLabel = candidate.codecLabel
-
-        val (encoder, surface) = instantiateAndStartEncoder(candidate)
-        videoEncoder = encoder
-        videoInputSurface = surface
-
-        virtualDisplay =
-          mediaProjection.createVirtualDisplay(
-            "PixelScreenRecorderDisplay",
-            actualWidth,
-            actualHeight,
-            densityDpi,
-            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            surface,
-            null,
-            null,
-          )
-
-        currentFallbackIndex = i
-        started = true
-        if (i > 0) {
-          val fallbackMsg = "Recording at ${candidate.label} (fallback)"
-          RecordingStateHolder.showSnackbarMessage(fallbackMsg)
-          RecordingStateHolder.setPendingSnackbarMessage(context, fallbackMsg)
+    fun createEncoderInstance(): MediaCodec {
+      val name = resolvedSpec.encoderName
+      val codec =
+        if (!name.isNullOrBlank()) {
+          MediaCodec.createByCodecName(name)
+        } else {
+          MediaCodec.createEncoderByType(actualVideoMime)
         }
-
-        if (BuildConfig.DEBUG) {
-          val modeLabel = if (config.isGamingMode) "Gaming" else "Balanced"
-          Log.d(
-            "EffectiveFormat",
-            "mode=$modeLabel, width=$actualWidth, height=$actualHeight, requestedFps=${config.fps}, encoder=$activeEncoderName, KEY_FRAME_RATE=$appliedKeyFrameRate",
-          )
-        }
-        break
-      } catch (err: Throwable) {
-        debugLog("Fallback candidate ${candidate.label} failed (${err.message}); retrying next", err)
-        lastError = err
-        try {
-          videoEncoder?.release()
-        } catch (_: Throwable) {} finally {
-          videoEncoder = null
-        }
-      }
-    }
-
-    if (!started) {
-      throw lastError ?: IllegalStateException("Failed to configure any video encoder in fallback chain")
-    }
-  }
-
-  private fun instantiateAndStartEncoder(candidate: FallbackVideoCandidate): Pair<MediaCodec, Surface> {
-    fun tryCreateEncoder(useSoftwareFallback: Boolean): MediaCodec {
-      val name = if (useSoftwareFallback) {
-        CapabilityProbe.findAnyH264EncoderName()
-      } else {
-        candidate.preferredEncoderName ?: CapabilityProbe.findPreferredEncoderInfo(candidate.mimeType)?.name
-      }
-      val mime = if (useSoftwareFallback) MediaFormat.MIMETYPE_VIDEO_AVC else candidate.mimeType
-      val codec = if (!name.isNullOrBlank()) {
-        MediaCodec.createByCodecName(name)
-      } else {
-        MediaCodec.createEncoderByType(mime)
-      }
       activeCodecCount.incrementAndGet()
       return codec
     }
 
-    var encoder = tryCreateEncoder(useSoftwareFallback = false)
-    var inputSurface: Surface? = null
+    var encoder = createEncoderInstance()
     try {
-      val format = buildCandidateVideoFormat(candidate)
-      val configuredFps = format.getInteger(MediaFormat.KEY_FRAME_RATE)
-      encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-      inputSurface = encoder.createInputSurface()
-      encoder.start()
-      activeEncoderName = runCatching { encoder.name }.getOrDefault(candidate.preferredEncoderName ?: "hardware")
-      appliedKeyFrameRate =
-        runCatching { encoder.inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE) }
-          .getOrNull()
-          ?: configuredFps
-      return encoder to inputSurface
-    } catch (e: Throwable) {
-      debugLog("Preferred encoder configure/start failed (${e.message}); attempting software/any H.264 encoder", e)
+      val primaryFormat = buildPrimaryVideoFormat(actualFps)
+      encoder.configure(primaryFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+    } catch (firstErr: Throwable) {
+      debugLog(
+        "Primary MediaFormat configure(fps=$actualFps) failed (${firstErr.message}); retrying with configureFps=$configureFps"
+      )
       try {
         encoder.release()
       } catch (_: Throwable) {} finally {
         activeCodecCount.decrementAndGet()
       }
-      encoder = tryCreateEncoder(useSoftwareFallback = true)
-      val swFormat = buildCandidateVideoFormat(candidate.copy(mimeType = MediaFormat.MIMETYPE_VIDEO_AVC))
-      val configuredFps = swFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
-      encoder.configure(swFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-      val surface = encoder.createInputSurface()
-      encoder.start()
-      activeEncoderName = runCatching { encoder.name }.getOrDefault("software-h264")
-      appliedKeyFrameRate =
-        runCatching { encoder.inputFormat.getInteger(MediaFormat.KEY_FRAME_RATE) }
-          .getOrNull()
-          ?: configuredFps
-      return encoder to surface
+      encoder = createEncoderInstance()
+      try {
+        val clampedFormat = buildPrimaryVideoFormat(configureFps)
+        encoder.configure(clampedFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      } catch (secondErr: Throwable) {
+        debugLog(
+          "Clamped MediaFormat configure(fps=$configureFps) failed (${secondErr.message}); retrying with fallback format"
+        )
+        try {
+          encoder.release()
+        } catch (_: Throwable) {} finally {
+          activeCodecCount.decrementAndGet()
+        }
+        encoder = createEncoderInstance()
+        val fallbackFormat = buildFallbackVideoFormat(configureFps)
+        encoder.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+      }
     }
+
+    val inputSurface = encoder.createInputSurface()
+    encoder.start()
+
+    videoEncoder = encoder
+    videoInputSurface = inputSurface
+
+    // Create VirtualDisplay at the exact same 16-aligned size, fixed for the entire recording
+    virtualDisplay =
+      mediaProjection.createVirtualDisplay(
+        "PixelScreenRecorderDisplay",
+        actualWidth,
+        actualHeight,
+        densityDpi,
+        DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+        inputSurface,
+        null,
+        null,
+      )
   }
 
   /**
-   * In Balanced mode, uses only: MIME, width, height, KEY_COLOR_FORMAT = COLOR_FormatSurface,
-   * KEY_BIT_RATE, KEY_FRAME_RATE = the selected fps, and KEY_I_FRAME_INTERVAL = 1. No other keys.
-   * KEY_MAX_FPS_TO_ENCODER is set only in Gaming mode, and only when the display refresh rate is
-   * at least 1.5x the target fps.
+   * Uses only: MIME (video/avc or video/hevc), width, height, KEY_COLOR_FORMAT = COLOR_FormatSurface,
+   * KEY_BIT_RATE, KEY_FRAME_RATE, and KEY_I_FRAME_INTERVAL = 1.
+   * Leaves KEY_BITRATE_MODE unset (device default).
    */
-  private fun buildCandidateVideoFormat(candidate: FallbackVideoCandidate): MediaFormat {
-    return MediaFormat.createVideoFormat(candidate.mimeType, candidate.width, candidate.height).apply {
+  private fun buildPrimaryVideoFormat(frameRate: Int = actualFps): MediaFormat {
+    return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
       setInteger(
         MediaFormat.KEY_COLOR_FORMAT,
         MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
       )
-      setInteger(MediaFormat.KEY_BIT_RATE, candidate.bitrateBps)
-      setInteger(MediaFormat.KEY_FRAME_RATE, candidate.fps)
+      setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
       setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-      if (config.isGamingMode && currentDisplayRefreshRateHz >= candidate.fps * 1.5f) {
-        setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, candidate.fps.toFloat())
-      }
+    }
+  }
+
+  /**
+   * Fallback format that drops KEY_BITRATE_MODE and KEY_I_FRAME_INTERVAL.
+   */
+  private fun buildFallbackVideoFormat(frameRate: Int = actualFps): MediaFormat {
+    return MediaFormat.createVideoFormat(actualVideoMime, actualWidth, actualHeight).apply {
+      setInteger(
+        MediaFormat.KEY_COLOR_FORMAT,
+        MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+      )
+      setInteger(MediaFormat.KEY_BIT_RATE, actualBitrateBps)
+      setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
     }
   }
 
@@ -1164,11 +1043,7 @@ class ScreenRecordingEngine(
       }
 
       val targetBitrate =
-        if (config.isGamingMode) {
-          if (audioChannelCount == 1) 64_000 else 96_000
-        } else {
-          if (audioChannelCount == 1) AUDIO_BITRATE_MONO else AUDIO_BITRATE_STEREO
-        }
+        if (audioChannelCount == 1) AUDIO_BITRATE_MONO else AUDIO_BITRATE_STEREO
       val aacFormat =
         MediaFormat.createAudioFormat(AUDIO_MIME, AUDIO_SAMPLE_RATE, audioChannelCount).apply {
           setInteger(
@@ -1230,34 +1105,17 @@ class ScreenRecordingEngine(
    * Never blocks on audio; uses dequeueOutputBuffer with a 10 ms timeout.
    */
   private fun startHighPriorityVideoDrainThread() {
-    videoDrainStartRealtimeMs = SystemClock.elapsedRealtime()
-    firstVideoBufferDrained = false
-    firstBufferTimeoutLogged = false
-
     val thread =
       Thread(
         {
           try {
-            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT)
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
           } catch (_: Throwable) {}
 
-          while (isRunning.get() && !isStopping.get() && !videoEosReceived) {
-            val vCodec = videoEncoder ?: break
-            try {
-              if (!firstVideoBufferDrained && !firstBufferTimeoutLogged) {
-                val elapsed = SystemClock.elapsedRealtime() - videoDrainStartRealtimeMs
-                if (elapsed >= 3000L) {
-                  firstBufferTimeoutLogged = true
-                  debugLog("First output buffer did not arrive within 3 seconds; requesting sync frame without lowering settings")
-                  try {
-                    val syncParams = Bundle().apply {
-                      putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                    }
-                    vCodec.setParameters(syncParams)
-                  } catch (_: Throwable) {}
-                }
-              }
+          val vCodec = videoEncoder ?: return@Thread
 
+          while (isRunning.get() && !isStopping.get() && !videoEosReceived) {
+            try {
               if (
                 !muxerStarted &&
                   videoTrackIndex >= 0 &&
@@ -1282,9 +1140,7 @@ class ScreenRecordingEngine(
           }
         },
         "RecorderVideoDrain",
-      ).apply {
-        priority = Thread.NORM_PRIORITY
-      }
+      )
     videoDrainThread = thread
     thread.start()
   }
@@ -1576,7 +1432,6 @@ class ScreenRecordingEngine(
         outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
         outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
           drainedAny = true
-          firstVideoBufferDrained = true
           synchronized(muxerLock) {
             if (!muxerStarted && videoTrackIndex < 0) {
               val outFormat = codec.outputFormat
@@ -1599,7 +1454,6 @@ class ScreenRecordingEngine(
         }
         outIndex >= 0 -> {
           drainedAny = true
-          firstVideoBufferDrained = true
           val encodedData = codec.getOutputBuffer(outIndex)
           val flags = reusableVideoBufferInfo.flags
           val isConfigBuffer = (flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
@@ -1628,38 +1482,6 @@ class ScreenRecordingEngine(
                 if (muxerStarted) {
                   mediaMuxer?.writeSampleData(videoTrackIndex, encodedData, reusableVideoBufferInfo)
                   videoSamplesWritten++
-
-                  if (BuildConfig.DEBUG) {
-                    framesSinceLastFrameCheck++
-                    val now = SystemClock.elapsedRealtime()
-                    if (lastFrameCheckRealtimeMs == 0L) {
-                      lastFrameCheckRealtimeMs = now
-                    } else {
-                      val elapsed = now - lastFrameCheckRealtimeMs
-                      if (elapsed >= 5000L) {
-                        val fpsAchieved = (framesSinceLastFrameCheck * 1000.0) / elapsed
-                        val dropped =
-                          try {
-                            codec.metrics?.getInt("android.media.mediacodec.dropped-frames", -1) ?: -1
-                          } catch (_: Throwable) {
-                            -1
-                          }
-                        val droppedStr = if (dropped >= 0) dropped.toString() else "unreported"
-                        Log.d(
-                          "FrameCheck",
-                          String.format(
-                            Locale.US,
-                            "encodedFps=%.1f (target=%d fps), droppedInputFrames=%s",
-                            fpsAchieved,
-                            actualFps,
-                            droppedStr,
-                          ),
-                        )
-                        lastFrameCheckRealtimeMs = now
-                        framesSinceLastFrameCheck = 0
-                      }
-                    }
-                  }
                 }
               }
             }
@@ -1724,7 +1546,7 @@ class ScreenRecordingEngine(
                     )
                     audioSamplesWritten++
                   } catch (writeErr: Throwable) {
-                    debugLog("Audio writeSampleData failed (${writeErr.message}), continuing video recording", writeErr)
+                    notifyFatalEngineError(writeErr)
                   }
                 }
               }

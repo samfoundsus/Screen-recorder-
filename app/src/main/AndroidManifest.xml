@@ -9,7 +9,6 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
-        android:name=".RecorderApp"
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
@@ -44,7 +43,6 @@
 
         <service
             android:name=".recorder.RecorderService"
-            android:process=":recorder"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density"
             android:enabled="true"
             android:exported="false"

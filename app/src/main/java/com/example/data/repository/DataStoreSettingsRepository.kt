@@ -41,7 +41,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     val GENERAL_COUNTDOWN_SECONDS = intPreferencesKey("general_countdown_seconds")
 
     // Video
-    val VIDEO_PERFORMANCE_MODE = stringPreferencesKey("video_performance_mode")
     val VIDEO_RESOLUTION = stringPreferencesKey("video_resolution")
     val VIDEO_FPS = intPreferencesKey("video_fps")
     val VIDEO_BITRATE = intPreferencesKey("video_bitrate_mbps")
@@ -107,7 +106,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         computeDefaultBitrateMbps(normalizedRes, updated.fps)
       }
     context.dataStore.edit { prefs ->
-      prefs[Keys.VIDEO_PERFORMANCE_MODE] = updated.performanceMode
       prefs[Keys.VIDEO_RESOLUTION] = normalizedRes
       prefs[Keys.VIDEO_FPS] = updated.fps
       prefs[Keys.VIDEO_BITRATE] = effectiveBitrateMbps
@@ -226,7 +224,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
           (prefs[Keys.GENERAL_COUNTDOWN_SECONDS] ?: defaultGeneral.countdownSeconds).coerceIn(0, 10),
       )
 
-    val performanceMode = prefs[Keys.VIDEO_PERFORMANCE_MODE] ?: defaultVideo.performanceMode
     val resolution =
       normalizeResolutionOption(prefs[Keys.VIDEO_RESOLUTION] ?: defaultVideo.resolution)
     val fps = prefs[Keys.VIDEO_FPS] ?: defaultVideo.fps
@@ -240,7 +237,6 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     val video =
       VideoSettings(
-        performanceMode = performanceMode,
         resolution = resolution,
         fps = fps,
         bitrateMbps = bitrateMbps,

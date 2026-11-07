@@ -42,13 +42,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Shape
-import androidx.compose.foundation.background
-import androidx.compose.foundation.lazy.items
 import androidx.compose.ui.input.nestedscroll.nestedScroll
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.BuildConfig
@@ -58,8 +54,6 @@ import com.example.domain.model.MainDestination
 import com.example.domain.model.NavDestinationConfig
 import com.example.domain.model.OptionProbeState
 import com.example.recorder.MemoryDiagnostics
-import com.example.recorder.StopLogManager
-import com.example.recorder.StopRecord
 import com.example.ui.components.pixelGroupedItemShape
 import java.util.Locale
 import kotlin.math.roundToInt
@@ -67,7 +61,6 @@ import kotlin.math.roundToInt
 private enum class ActiveSettingsDialog {
   NONE,
   GENERAL_COUNTDOWN,
-  VIDEO_PERFORMANCE_MODE,
   VIDEO_RESOLUTION,
   VIDEO_FPS,
   VIDEO_BITRATE,
@@ -81,7 +74,6 @@ private enum class ActiveSettingsDialog {
   APPEARANCE_NAV_ORDER,
   APPEARANCE_THEME,
   ABOUT_MEMORY_DEBUG,
-  ABOUT_STOP_LOG,
   ABOUT_RESET,
 }
 
@@ -95,7 +87,6 @@ fun SettingsScreen(
   onRefreshMemoryDiagnostics: () -> Unit,
   onUpdateShowInQuickSettings: (Boolean) -> Unit,
   onUpdateCountdownSeconds: (Int) -> Unit,
-  onUpdatePerformanceMode: (String) -> Unit = {},
   onUpdateResolution: (String) -> Unit,
   onUpdateFps: (Int) -> Unit,
   onUpdateBitrate: (Int) -> Unit,
@@ -196,25 +187,11 @@ fun SettingsScreen(
         item(key = "header_video") {
           PixelSectionHeader(text = stringResource(R.string.settings_section_video))
         }
-        item(key = "video_performance_mode") {
-          PixelSettingsRow(
-            title = "Performance mode",
-            summary =
-              if (video.performanceMode == "Gaming") {
-                "Gaming · Lower load on the device so games run smoother while recording."
-              } else {
-                "Balanced"
-              },
-            shape = pixelGroupedItemShape(index = 0, totalCount = 8),
-            onClick = { activeDialog = ActiveSettingsDialog.VIDEO_PERFORMANCE_MODE },
-            testTag = "settings_video_performance_mode",
-          )
-        }
         item(key = "video_resolution") {
           PixelSettingsRow(
             title = "Resolution",
             summary = video.resolution,
-            shape = pixelGroupedItemShape(index = 1, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 0, totalCount = 7),
             onClick = {
               onOpenResolutionPicker()
               activeDialog = ActiveSettingsDialog.VIDEO_RESOLUTION
@@ -226,7 +203,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Frame rate",
             summary = "${video.fps} FPS",
-            shape = pixelGroupedItemShape(index = 2, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 1, totalCount = 7),
             onClick = {
               onOpenFpsPicker()
               activeDialog = ActiveSettingsDialog.VIDEO_FPS
@@ -243,7 +220,7 @@ fun SettingsScreen(
               } else {
                 "${video.bitrateMbps} Mbps (auto-scaled)"
               },
-            shape = pixelGroupedItemShape(index = 3, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 2, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_BITRATE },
             testTag = "settings_video_bitrate",
           )
@@ -252,7 +229,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Codec",
             summary = video.codec,
-            shape = pixelGroupedItemShape(index = 4, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 3, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CODEC },
             testTag = "settings_video_codec",
           )
@@ -261,7 +238,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Container",
             summary = video.container,
-            shape = pixelGroupedItemShape(index = 5, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 4, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CONTAINER },
             testTag = "settings_video_container",
           )
@@ -270,7 +247,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Orientation",
             summary = video.orientation,
-            shape = pixelGroupedItemShape(index = 6, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 5, totalCount = 7),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_ORIENTATION },
             testTag = "settings_video_orientation",
           )
@@ -279,7 +256,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Re-test device support",
             summary = "Clear cached encoder probe results and test again",
-            shape = pixelGroupedItemShape(index = 7, totalCount = 8),
+            shape = pixelGroupedItemShape(index = 6, totalCount = 7),
             onClick = onRetestDeviceSupport,
             testTag = "settings_video_retest_support",
           )
@@ -469,41 +446,34 @@ fun SettingsScreen(
         }
 
         // SECTION 5: ABOUT
-        val hasMemoryDebug = BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED
-        val hasStopLog = BuildConfig.DEBUG
-        val aboutTotalCount = 2 + (if (hasMemoryDebug) 1 else 0) + (if (hasStopLog) 1 else 0) + 1
-        var nextAboutIndex = 0
-
+        val aboutTotalCount = if (BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED) 4 else 3
         item(key = "header_about") {
           PixelSectionHeader(text = stringResource(R.string.settings_section_about))
         }
         item(key = "about_version") {
-          val currentIndex = nextAboutIndex++
           PixelSettingsRow(
             title = "Version",
             summary = "${BuildConfig.VERSION_NAME} (Pixel UI Architecture)",
-            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+            shape = pixelGroupedItemShape(index = 0, totalCount = aboutTotalCount),
             onClick = {},
             testTag = "settings_about_version",
           )
         }
         item(key = "about_hardware") {
-          val currentIndex = nextAboutIndex++
           PixelSettingsRow(
             title = "Device capability profile",
             summary = "${capabilities.deviceModelSummary} (${capabilities.hardwareEncoderSummary})",
-            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+            shape = pixelGroupedItemShape(index = 1, totalCount = aboutTotalCount),
             onClick = {},
             testTag = "settings_about_hardware",
           )
         }
-        if (hasMemoryDebug) {
+        if (BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED) {
           item(key = "about_memory_debug") {
-            val currentIndex = nextAboutIndex++
             PixelSettingsRow(
               title = "Memory (debug)",
               summary = memorySnapshot.summaryText,
-              shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+              shape = pixelGroupedItemShape(index = 2, totalCount = aboutTotalCount),
               onClick = {
                 onRefreshMemoryDiagnostics()
                 activeDialog = ActiveSettingsDialog.ABOUT_MEMORY_DEBUG
@@ -512,26 +482,12 @@ fun SettingsScreen(
             )
           }
         }
-        if (hasStopLog) {
-          item(key = "about_stop_log") {
-            val currentIndex = nextAboutIndex++
-            PixelSettingsRow(
-              title = "Stop log",
-              summary = "View reasons and diagnostics for the last 10 stops",
-              shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
-              onClick = {
-                activeDialog = ActiveSettingsDialog.ABOUT_STOP_LOG
-              },
-              testTag = "settings_about_stop_log",
-            )
-          }
-        }
         item(key = "about_reset") {
-          val currentIndex = nextAboutIndex++
+          val resetIndex = if (BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED) 3 else 2
           PixelSettingsRow(
             title = "Reset preferences",
             summary = "Restore default video, audio, and navigation settings",
-            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+            shape = pixelGroupedItemShape(index = resetIndex, totalCount = aboutTotalCount),
             onClick = { activeDialog = ActiveSettingsDialog.ABOUT_RESET },
             testTag = "settings_about_reset",
           )
@@ -555,20 +511,6 @@ fun SettingsScreen(
         selectedOption = selectedLabel,
         onSelect = { choice ->
           onUpdateCountdownSeconds(if (choice.startsWith("3")) 3 else 0)
-          activeDialog = ActiveSettingsDialog.NONE
-        },
-        onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
-      )
-    }
-    ActiveSettingsDialog.VIDEO_PERFORMANCE_MODE -> {
-      SingleChoiceSettingsDialog(
-        title = "Performance mode",
-        options = listOf("Balanced", "Gaming"),
-        selectedOption = video.performanceMode,
-        optionSummaries =
-          mapOf("Gaming" to "Lower load on the device so games run smoother while recording."),
-        onSelect = { choice ->
-          onUpdatePerformanceMode(choice)
           activeDialog = ActiveSettingsDialog.NONE
         },
         onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
@@ -730,17 +672,12 @@ fun SettingsScreen(
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
               Text(
                 text =
-                  "Recorder process PSS: ${memorySnapshot.recorderPssMbText}" +
-                    if (memorySnapshot.recorderPssKb > 0) " (${memorySnapshot.recorderPssKb} KB)" else "",
-                style = MaterialTheme.typography.bodyMedium,
-              )
-              Text(
-                text = "UI process PSS: ${memorySnapshot.uiPssMbText} (${memorySnapshot.uiPssKb} KB)",
+                  "Current total PSS: ${memorySnapshot.currentPssMbText} (${memorySnapshot.currentPssKb} KB)",
                 style = MaterialTheme.typography.bodyMedium,
               )
               Text(
                 text =
-                  "Peak recorder PSS: ${memorySnapshot.peakLastRecordingPssMbText}" +
+                  "Peak PSS (last recording): ${memorySnapshot.peakLastRecordingPssMbText}" +
                     if (memorySnapshot.peakLastRecordingPssKb > 0) {
                       " (${memorySnapshot.peakLastRecordingPssKb} KB)"
                     } else {
@@ -778,82 +715,6 @@ fun SettingsScreen(
       } else {
         activeDialog = ActiveSettingsDialog.NONE
       }
-    }
-    ActiveSettingsDialog.ABOUT_STOP_LOG -> {
-      val context = LocalContext.current
-      val recentStops = remember { StopLogManager.getRecentStops(context) }
-      AlertDialog(
-        onDismissRequest = { activeDialog = ActiveSettingsDialog.NONE },
-        title = { Text("Recording stop log") },
-        text = {
-          if (recentStops.isEmpty()) {
-            Text(
-              text = "No recorded stop events yet.",
-              style = MaterialTheme.typography.bodyMedium,
-              color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-          } else {
-            LazyColumn(
-              modifier = Modifier.fillMaxWidth(),
-              verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-              items(recentStops) { stop ->
-                Surface(
-                  shape = RoundedCornerShape(12.dp),
-                  color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                  modifier = Modifier.fillMaxWidth(),
-                ) {
-                  Column(
-                    modifier = Modifier
-                      .fillMaxWidth()
-                      .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                  ) {
-                    Row(
-                      modifier = Modifier.fillMaxWidth(),
-                      horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                      Text(
-                        text = stop.reason.formattedReason(),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface,
-                      )
-                      Text(
-                        text = stop.formatDuration(),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                      )
-                    }
-                    val message = stop.reason.message
-                    if (!message.isNullOrBlank()) {
-                      Text(
-                        text = message,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error,
-                      )
-                    }
-                    Text(
-                      text = "${stop.resolution} • ${stop.fps} fps • ${stop.codec} • ${stop.bitrateMbps} Mbps",
-                      style = MaterialTheme.typography.bodySmall,
-                      color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Text(
-                      text = stop.formatDateTime(),
-                      style = MaterialTheme.typography.labelSmall,
-                      color = MaterialTheme.colorScheme.outline,
-                    )
-                  }
-                }
-              }
-            }
-          }
-        },
-        confirmButton = {
-          TextButton(onClick = { activeDialog = ActiveSettingsDialog.NONE }) {
-            Text("Close")
-          }
-        },
-      )
     }
     ActiveSettingsDialog.ABOUT_RESET -> {
       AlertDialog(
@@ -1195,7 +1056,6 @@ private fun SingleChoiceSettingsDialog(
   title: String,
   options: List<String>,
   selectedOption: String,
-  optionSummaries: Map<String, String>? = null,
   onSelect: (String) -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -1205,7 +1065,6 @@ private fun SingleChoiceSettingsDialog(
     text = {
       Column {
         options.forEach { option ->
-          val summary = optionSummaries?.get(option)
           Row(
             modifier =
               Modifier.fillMaxWidth()
@@ -1219,24 +1078,12 @@ private fun SingleChoiceSettingsDialog(
               onClick = null,
             )
             Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
-              Text(
-                text = option,
-                style = MaterialTheme.typography.bodyLarge,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-              )
-              if (!summary.isNullOrBlank()) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                  text = summary,
-                  style = MaterialTheme.typography.bodySmall,
-                  color = MaterialTheme.colorScheme.onSurfaceVariant,
-                  maxLines = 2,
-                  overflow = TextOverflow.Ellipsis,
-                )
-              }
-            }
+            Text(
+              text = option,
+              style = MaterialTheme.typography.bodyLarge,
+              maxLines = 1,
+              overflow = TextOverflow.Ellipsis,
+            )
           }
         }
       }

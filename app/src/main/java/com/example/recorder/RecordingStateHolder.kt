@@ -8,7 +8,6 @@ import android.os.Handler
 import android.os.Looper
 import com.example.MainActivity
 import com.example.domain.model.RecorderState
-import com.example.recorder.ipc.RecorderClient
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,6 +16,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+enum class StopReason(val notificationTitle: String?) {
+  USER_STOP(null),
+  STORAGE_ALMOST_FULL("Stopped: storage almost full"),
+  BATTERY_LOW("Stopped: battery low"),
+  DEVICE_TOO_HOT("Stopped: device too hot"),
+  INTERRUPTED("Stopped: recording was interrupted"),
+}
 
 sealed interface RecordingEngineStatus {
   data object Idle : RecordingEngineStatus
@@ -87,7 +93,6 @@ object RecordingStateHolder {
     pendingBackgroundRunnable?.let { mainHandler.removeCallbacks(it) }
     pendingBackgroundRunnable = null
     _isAppInForeground.value = inForeground
-    RecorderClient.peekInstance()?.setAppInForeground(inForeground)
   }
 
   fun registerActivityLifecycle(app: Application) {
@@ -99,14 +104,18 @@ object RecordingStateHolder {
         override fun onActivityStarted(activity: Activity) {
           if (activity is MainActivity) {
             startedActivitiesCount++
-            setAppInForeground(true)
+            pendingBackgroundRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingBackgroundRunnable = null
+            _isAppInForeground.value = true
           }
         }
 
         override fun onActivityResumed(activity: Activity) {
           if (activity is MainActivity) {
             startedActivitiesCount = maxOf(startedActivitiesCount, 1)
-            setAppInForeground(true)
+            pendingBackgroundRunnable?.let { mainHandler.removeCallbacks(it) }
+            pendingBackgroundRunnable = null
+            _isAppInForeground.value = true
           }
         }
 
@@ -121,7 +130,7 @@ object RecordingStateHolder {
               pendingBackgroundRunnable?.let { mainHandler.removeCallbacks(it) }
               val runnable = Runnable {
                 if (startedActivitiesCount == 0) {
-                  setAppInForeground(false)
+                  _isAppInForeground.value = false
                 }
               }
               pendingBackgroundRunnable = runnable
@@ -133,7 +142,7 @@ object RecordingStateHolder {
         override fun onActivityDestroyed(activity: Activity) {
           if (activity is MainActivity) {
             if (!activity.isChangingConfigurations && startedActivitiesCount == 0) {
-              setAppInForeground(false)
+              _isAppInForeground.value = false
             }
           }
         }

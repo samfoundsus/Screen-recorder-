@@ -19,8 +19,6 @@ import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.example.domain.model.AppSettings
 import com.example.domain.repository.SettingsRepository
-import com.example.recorder.ipc.RecorderClient
-import com.example.recorder.ipc.RecorderSettingsSnapshot
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -30,7 +28,6 @@ import kotlinx.coroutines.launch
  * dialog ("Allow floating controls?" with "Open settings" and "Not now"), runtime permissions
  * (`POST_NOTIFICATIONS` on API 33+ and `RECORD_AUDIO` when mic or internal audio is enabled),
  * and the single-use `MediaProjection` screen capture consent flow.
- * Passes a serializable [RecorderSettingsSnapshot] to [RecorderClient] to start the `:recorder` process.
  */
 class RecordingPermissionCoordinator(
   private val activity: ComponentActivity,
@@ -82,27 +79,15 @@ class RecordingPermissionCoordinator(
           return@registerForActivityResult
         }
         try {
-          val (px, py) = RecorderClient.loadSavedPositionFractions(activity, isLandscape = false)
-          val (lx, ly) = RecorderClient.loadSavedPositionFractions(activity, isLandscape = true)
-          val (snapshot, gamingSnackbar) =
-            RecorderSettingsSnapshot.createForRecording(
-              settings = settings,
+          val serviceIntent =
+            RecorderService.createStartIntent(
               context = activity.applicationContext,
-              portraitXFrac = px,
-              portraitYFrac = py,
-              landscapeXFrac = lx,
-              landscapeYFrac = ly,
+              resultCode = result.resultCode,
+              resultData = data,
+              settings = settings,
+              restoreControlsAfterStop = false,
             )
-          if (gamingSnackbar != null) {
-            RecordingStateHolder.showSnackbarMessage(gamingSnackbar)
-          }
-          RecorderClient.startRecording(
-            context = activity.applicationContext,
-            resultCode = result.resultCode,
-            resultData = data,
-            snapshot = snapshot,
-            restoreControlsAfterStop = false,
-          )
+          ContextCompat.startForegroundService(activity.applicationContext, serviceIntent)
         } catch (t: Throwable) {
           Log.e(ScreenRecordingEngine.TAG, "Failed to start RecorderService", t)
           RecordingStateHolder.reportError("Unable to start recording service.")
@@ -126,10 +111,9 @@ class RecordingPermissionCoordinator(
     try {
       // Pre-flight storage check: refuse to start below 300 MB and show a snackbar
       if (!ScreenRecordingEngine.hasEnoughStorageToStart(activity.applicationContext)) {
-        val minMb = ScreenRecordingEngine.getMinimumStorageStartBytes(activity.applicationContext) / (1024 * 1024)
         pendingSettings = null
         RecordingStateHolder.reportError(
-          "Not enough storage space to start recording (at least $minMb MB required)."
+          "Not enough storage space to start recording (at least 300 MB required)."
         )
         return
       }

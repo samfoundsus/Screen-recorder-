@@ -55,8 +55,6 @@ data class VideoMetadata(
   val hasAudio: Boolean = true,
   val audioChannelMode: String = "Stereo",
   val noiseSuppression: Boolean = false,
-  val measuredAvgFps: Double? = null,
-  val requestedFps: Int? = null,
 )
 
 data class RecordingItem(

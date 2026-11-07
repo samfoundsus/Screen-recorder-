@@ -69,9 +69,6 @@ class SettingsViewModel(
   fun refreshMemoryDiagnostics(context: Context) {
     if (MemoryDiagnostics.IS_ENABLED) {
       MemoryDiagnostics.refreshSnapshot(context)
-      try {
-        com.example.recorder.ipc.RecorderClient.getInstance(context).requestMemoryStats()
-      } catch (_: Throwable) {}
     }
   }
 
@@ -109,12 +106,6 @@ class SettingsViewModel(
   }
 
   // Video
-  fun updatePerformanceMode(mode: String) {
-    viewModelScope.launch {
-      settingsRepository.updateVideoSettings { it.copy(performanceMode = mode) }
-    }
-  }
-
   fun updateResolution(resolution: String) {
     viewModelScope.launch {
       val probeState = uiState.value.resolutionProbeStates[resolution]
