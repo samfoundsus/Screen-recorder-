@@ -1,5 +1,6 @@
 package com.example.ui.settings
 
+import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -11,7 +12,10 @@ import com.example.domain.model.NavDestinationConfig
 import com.example.domain.model.OptionProbeState
 import com.example.domain.repository.CapabilitiesProvider
 import com.example.domain.repository.SettingsRepository
+import com.example.recorder.MemoryDiagnosticSnapshot
+import com.example.recorder.MemoryDiagnostics
 import com.example.recorder.RecordingStateHolder
+import com.example.recorder.ScreenRecorderTileService
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -24,6 +28,7 @@ data class SettingsUiState(
   val resolutionProbeStates: Map<String, OptionProbeState> = emptyMap(),
   val fpsProbeStates: Map<Int, OptionProbeState> = emptyMap(),
   val displayRefreshRateHz: Int = 60,
+  val memorySnapshot: MemoryDiagnosticSnapshot = MemoryDiagnosticSnapshot(),
 )
 
 class SettingsViewModel(
@@ -39,13 +44,15 @@ class SettingsViewModel(
         settingsRepository.settings,
         capabilitiesProvider.resolutionProbeStates,
         capabilitiesProvider.fpsProbeStates,
-      ) { appSettings, resProbes, fpsProbes ->
+        MemoryDiagnostics.snapshot,
+      ) { appSettings, resProbes, fpsProbes, memSnap ->
         SettingsUiState(
           settings = appSettings,
           capabilities = capabilities,
           resolutionProbeStates = resProbes,
           fpsProbeStates = fpsProbes,
           displayRefreshRateHz = displayRefreshRateHz,
+          memorySnapshot = memSnap,
         )
       }
       .stateIn(
@@ -55,8 +62,18 @@ class SettingsViewModel(
           SettingsUiState(
             capabilities = capabilities,
             displayRefreshRateHz = displayRefreshRateHz,
+            memorySnapshot = MemoryDiagnostics.snapshot.value,
           ),
       )
+
+  fun refreshMemoryDiagnostics(context: Context) {
+    if (MemoryDiagnostics.IS_ENABLED) {
+      MemoryDiagnostics.refreshSnapshot(context)
+      try {
+        com.example.recorder.ipc.RecorderClient.getInstance(context).requestMemoryStats()
+      } catch (_: Throwable) {}
+    }
+  }
 
   fun onOpenResolutionPicker() {
     val video = uiState.value.settings.video
@@ -75,7 +92,29 @@ class SettingsViewModel(
     }
   }
 
+  // General
+  fun updateShowInQuickSettings(context: Context, enabled: Boolean) {
+    viewModelScope.launch {
+      settingsRepository.updateGeneralSettings { it.copy(showInQuickSettings = enabled) }
+      ScreenRecorderTileService.setTileComponentEnabled(context, enabled)
+    }
+  }
+
+  fun updateCountdownSeconds(seconds: Int) {
+    viewModelScope.launch {
+      settingsRepository.updateGeneralSettings {
+        it.copy(countdownSeconds = seconds.coerceIn(0, 10))
+      }
+    }
+  }
+
   // Video
+  fun updatePerformanceMode(mode: String) {
+    viewModelScope.launch {
+      settingsRepository.updateVideoSettings { it.copy(performanceMode = mode) }
+    }
+  }
+
   fun updateResolution(resolution: String) {
     viewModelScope.launch {
       val probeState = uiState.value.resolutionProbeStates[resolution]
@@ -168,7 +207,17 @@ class SettingsViewModel(
 
   fun updateMicEnabled(enabled: Boolean) {
     viewModelScope.launch {
-      settingsRepository.updateAudioSettings { it.copy(micEnabled = enabled) }
+      settingsRepository.updateAudioSettings { current ->
+        val nextSource =
+          if (enabled && current.source == "Device audio only") {
+            "Device audio + Mic"
+          } else if (!enabled && current.source == "Device audio + Mic") {
+            "Device audio only"
+          } else {
+            current.source
+          }
+        current.copy(micEnabled = enabled, source = nextSource)
+      }
     }
   }
 
@@ -211,15 +260,19 @@ class SettingsViewModel(
     }
   }
 
-  fun updateFloatingGestures(gestureAction: String) {
+  fun updateFloatingKeepEdgeHandleWhileRecording(enabled: Boolean) {
     viewModelScope.launch {
-      settingsRepository.updateFloatingControlsSettings { it.copy(gestureAction = gestureAction) }
+      settingsRepository.updateFloatingControlsSettings {
+        it.copy(keepEdgeHandleWhileRecording = enabled)
+      }
     }
   }
 
-  fun updateFloatingInvisibleMode(enabled: Boolean) {
+  fun updateFloatingHideControlsFromVideo(enabled: Boolean) {
     viewModelScope.launch {
-      settingsRepository.updateFloatingControlsSettings { it.copy(invisibleMode = enabled) }
+      settingsRepository.updateFloatingControlsSettings {
+        it.copy(hideControlsFromVideo = enabled)
+      }
     }
   }
 

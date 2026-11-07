@@ -1,5 +1,8 @@
 package com.example.ui.library
 
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
@@ -29,11 +32,15 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -90,6 +97,8 @@ fun LibraryScreen(
   onRequestBatchDelete: () -> Unit,
   onDismissBatchDelete: () -> Unit,
   onConfirmBatchDelete: () -> Unit,
+  onRenameRecording: (String, String) -> Unit,
+  onDeleteSingleRecording: (String) -> Unit,
   onClearFilters: () -> Unit,
   onOpenRecording: (String) -> Unit,
   modifier: Modifier = Modifier,
@@ -98,8 +107,13 @@ fun LibraryScreen(
     BackHandler { onClearSelection() }
   }
 
+  val context = LocalContext.current
   val scrollBehavior = TopAppBarDefaults.enterAlwaysScrollBehavior()
   var showSortFilterSheet by rememberSaveable { mutableStateOf(false) }
+
+  var itemToRename by remember { mutableStateOf<RecordingItem?>(null) }
+  var itemForDetails by remember { mutableStateOf<RecordingItem?>(null) }
+  var itemToDeleteSingle by remember { mutableStateOf<RecordingItem?>(null) }
 
   Scaffold(
     modifier = modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
@@ -126,6 +140,19 @@ fun LibraryScreen(
             )
           },
           actions = {
+            IconButton(
+              onClick = {
+                val selectedItems =
+                  uiState.filteredRecordings.filter { it.id in uiState.selectedIds }
+                shareRecordings(context, selectedItems)
+              },
+              modifier = Modifier.testTag("library_batch_share_button"),
+            ) {
+              Icon(
+                imageVector = Icons.Filled.Share,
+                contentDescription = "Share selected",
+              )
+            }
             IconButton(
               onClick = onSelectAllVisible,
               modifier = Modifier.testTag("library_select_all_button"),
@@ -261,7 +288,7 @@ fun LibraryScreen(
           )
         }
 
-        // Category Filter Chips Row (hidden when there is only one category)
+        // Category Filter Chips Row
         if (uiState.availableCategories.size > 1) {
           item(key = "category_chips") {
             val chipColors =
@@ -338,6 +365,10 @@ fun LibraryScreen(
                 }
               },
               onLongClick = { onToggleItemSelection(item.id) },
+              onRenameClick = { itemToRename = item },
+              onShareClick = { shareRecordings(context, listOf(item)) },
+              onDetailsClick = { itemForDetails = item },
+              onDeleteClick = { itemToDeleteSingle = item },
             )
             Spacer(modifier = Modifier.height(6.dp))
           }
@@ -357,6 +388,53 @@ fun LibraryScreen(
         onSelectDateFilter(DateFilter.ALL_TIME)
       },
       onDismiss = { showSortFilterSheet = false },
+    )
+  }
+
+  itemToRename?.let { target ->
+    RenameRecordingDialog(
+      currentTitle = target.title,
+      onConfirm = { newTitle ->
+        onRenameRecording(target.id, newTitle)
+        itemToRename = null
+      },
+      onDismiss = { itemToRename = null },
+    )
+  }
+
+  itemForDetails?.let { target ->
+    RecordingDetailsDialog(
+      item = target,
+      onDismiss = { itemForDetails = null },
+    )
+  }
+
+  itemToDeleteSingle?.let { target ->
+    AlertDialog(
+      onDismissRequest = { itemToDeleteSingle = null },
+      title = { Text("Delete recording?") },
+      text = {
+        Text(
+          "Permanently delete \"${target.title}\" (${FormatUtils.formatFileSize(target.sizeBytes)})? This action cannot be undone.",
+          style = MaterialTheme.typography.bodyMedium,
+        )
+      },
+      confirmButton = {
+        TextButton(
+          onClick = {
+            onDeleteSingleRecording(target.id)
+            itemToDeleteSingle = null
+          },
+          modifier = Modifier.testTag("library_confirm_single_delete_button"),
+        ) {
+          Text("Delete", color = MaterialTheme.colorScheme.error)
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { itemToDeleteSingle = null }) {
+          Text("Cancel")
+        }
+      },
     )
   }
 
@@ -398,6 +476,36 @@ fun LibraryScreen(
   }
 }
 
+fun shareRecordings(context: Context, items: List<RecordingItem>) {
+  val validUris =
+    items.mapNotNull { item ->
+      item.contentUri.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+    }
+  if (validUris.isEmpty()) return
+
+  try {
+    val shareIntent =
+      if (validUris.size == 1) {
+        Intent(Intent.ACTION_SEND).apply {
+          type = "video/mp4"
+          putExtra(Intent.EXTRA_STREAM, validUris.first())
+          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+      } else {
+        Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+          type = "video/mp4"
+          putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(validUris))
+          addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+      }
+    val chooser =
+      Intent.createChooser(shareIntent, "Share recording").apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+      }
+    context.startActivity(chooser)
+  } catch (_: Throwable) {}
+}
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun FlatLibraryRecordingRow(
@@ -406,11 +514,16 @@ private fun FlatLibraryRecordingRow(
   isSelectionMode: Boolean,
   onClick: () -> Unit,
   onLongClick: () -> Unit,
+  onRenameClick: () -> Unit,
+  onShareClick: () -> Unit,
+  onDetailsClick: () -> Unit,
+  onDeleteClick: () -> Unit,
 ) {
   val context = LocalContext.current
   var metadata by remember(item.contentUri) {
     mutableStateOf(RecordingMediaCache.getCachedMetadata(item.contentUri))
   }
+  var menuExpanded by remember { mutableStateOf(false) }
 
   LaunchedEffect(item.contentUri) {
     if (metadata == null && item.contentUri.isNotBlank()) {
@@ -444,7 +557,7 @@ private fun FlatLibraryRecordingRow(
           onClick = onClick,
           onLongClick = onLongClick,
         )
-        .padding(horizontal = 24.dp, vertical = 16.dp)
+        .padding(start = 24.dp, end = 12.dp, top = 16.dp, bottom = 16.dp)
         .testTag("library_item_${item.id}"),
     verticalAlignment = Alignment.CenterVertically,
   ) {
@@ -481,6 +594,211 @@ private fun FlatLibraryRecordingRow(
         overflow = TextOverflow.Ellipsis,
       )
     }
+
+    if (!isSelectionMode) {
+      Box {
+        IconButton(
+          onClick = { menuExpanded = true },
+          modifier = Modifier.testTag("library_item_menu_${item.id}"),
+        ) {
+          Icon(
+            imageVector = Icons.Filled.MoreVert,
+            contentDescription = "More options",
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+        DropdownMenu(
+          expanded = menuExpanded,
+          onDismissRequest = { menuExpanded = false },
+        ) {
+          DropdownMenuItem(
+            text = { Text("Rename") },
+            onClick = {
+              menuExpanded = false
+              onRenameClick()
+            },
+            modifier = Modifier.testTag("library_menu_rename_${item.id}"),
+          )
+          DropdownMenuItem(
+            text = { Text("Share") },
+            onClick = {
+              menuExpanded = false
+              onShareClick()
+            },
+            modifier = Modifier.testTag("library_menu_share_${item.id}"),
+          )
+          DropdownMenuItem(
+            text = { Text("Details") },
+            onClick = {
+              menuExpanded = false
+              onDetailsClick()
+            },
+            modifier = Modifier.testTag("library_menu_details_${item.id}"),
+          )
+          DropdownMenuItem(
+            text = {
+              Text(
+                text = "Delete",
+                color = MaterialTheme.colorScheme.error,
+              )
+            },
+            onClick = {
+              menuExpanded = false
+              onDeleteClick()
+            },
+            modifier = Modifier.testTag("library_menu_delete_${item.id}"),
+          )
+        }
+      }
+    }
+  }
+}
+
+@Composable
+fun RenameRecordingDialog(
+  currentTitle: String,
+  onConfirm: (String) -> Unit,
+  onDismiss: () -> Unit,
+) {
+  var textValue by rememberSaveable(currentTitle) { mutableStateOf(currentTitle) }
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("Rename recording") },
+    text = {
+      OutlinedTextField(
+        value = textValue,
+        onValueChange = { textValue = it },
+        label = { Text("Name") },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth().testTag("rename_dialog_input"),
+      )
+    },
+    confirmButton = {
+      TextButton(
+        onClick = { onConfirm(textValue.trim()) },
+        enabled = textValue.trim().isNotEmpty(),
+        modifier = Modifier.testTag("rename_dialog_confirm"),
+      ) {
+        Text("Save")
+      }
+    },
+    dismissButton = {
+      TextButton(onClick = onDismiss) {
+        Text("Cancel")
+      }
+    },
+  )
+}
+
+@Composable
+fun RecordingDetailsDialog(
+  item: RecordingItem,
+  onDismiss: () -> Unit,
+) {
+  val context = LocalContext.current
+  var metadata by remember(item.contentUri) {
+    mutableStateOf(RecordingMediaCache.getCachedMetadata(item.contentUri))
+  }
+
+  LaunchedEffect(item.contentUri) {
+    if (item.contentUri.isNotBlank()) {
+      metadata = RecordingMediaCache.loadMetadata(context, item.contentUri)
+    }
+  }
+
+  val resolvedResolution = metadata?.resolution ?: item.resolution
+  val resolvedFps = metadata?.fps ?: item.fps
+  val resolvedBitrateMbps = metadata?.bitrateMbps ?: item.bitrateMbps
+  val resolvedCodec = metadata?.codec ?: item.codec
+  val resolvedHasAudio = metadata?.hasAudio ?: item.hasMicAudio
+  val resolvedAudioChannel =
+    if ((metadata?.audioChannelMode ?: item.audioChannelMode).equals("Mono", ignoreCase = true)) {
+      "Mono"
+    } else {
+      "Stereo"
+    }
+  val resolvedNoiseSuppression = metadata?.noiseSuppression ?: item.noiseSuppression
+  val audioLine = if (resolvedHasAudio) "AAC · $resolvedAudioChannel" else "Muted"
+
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    title = { Text("Recording details") },
+    text = {
+      Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        DetailSpecRow("Name", "${item.title}.${item.container.lowercase()}")
+        DetailSpecRow("Resolution", resolvedResolution)
+        val reqFps = metadata?.requestedFps ?: item.fps
+        val measuredFps = metadata?.measuredAvgFps
+        val recordedFpsText = when {
+          measuredFps != null && measuredFps > 0.0 -> {
+            val recordedFpsInt = Math.round(measuredFps).toInt()
+            if (reqFps != null && reqFps > 0) {
+              "Requested $reqFps fps · Recorded $recordedFpsInt fps average"
+            } else {
+              "Recorded $recordedFpsInt fps average"
+            }
+          }
+          resolvedFps != null && resolvedFps > 0 -> {
+            if (reqFps != null && reqFps > 0 && reqFps != resolvedFps) {
+              "Requested $reqFps fps · Recorded $resolvedFps fps average"
+            } else {
+              "$resolvedFps FPS"
+            }
+          }
+          else -> "Variable"
+        }
+        DetailSpecRow(
+          "Frame rate",
+          recordedFpsText,
+        )
+        DetailSpecRow(
+          "Bitrate",
+          if (resolvedBitrateMbps != null && resolvedBitrateMbps > 0) {
+            "$resolvedBitrateMbps Mbps"
+          } else {
+            "Auto"
+          },
+        )
+        DetailSpecRow("Codec", resolvedCodec)
+        DetailSpecRow("Audio", audioLine)
+        DetailSpecRow("Noise suppression", if (resolvedNoiseSuppression) "On" else "Off")
+        DetailSpecRow("Container", item.container)
+        DetailSpecRow("Duration", FormatUtils.formatDurationBadge(item.durationMs))
+        DetailSpecRow("File size", FormatUtils.formatFileSize(item.sizeBytes))
+        DetailSpecRow("Recorded", FormatUtils.formatRelativeDate(item.createdAtEpochMs))
+      }
+    },
+    confirmButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.testTag("details_dialog_close"),
+      ) {
+        Text("Close")
+      }
+    },
+  )
+}
+
+@Composable
+private fun DetailSpecRow(label: String, value: String) {
+  Row(
+    modifier = Modifier.fillMaxWidth(),
+    horizontalArrangement = Arrangement.SpaceBetween,
+    verticalAlignment = Alignment.Top,
+  ) {
+    Text(
+      text = label,
+      style = MaterialTheme.typography.bodyMedium,
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
+      modifier = Modifier.padding(end = 12.dp),
+    )
+    Text(
+      text = value,
+      style = MaterialTheme.typography.bodyMedium,
+      color = MaterialTheme.colorScheme.onSurface,
+      textAlign = TextAlign.End,
+    )
   }
 }
 

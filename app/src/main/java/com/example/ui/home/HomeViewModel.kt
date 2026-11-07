@@ -12,6 +12,7 @@ import com.example.domain.repository.CapabilitiesProvider
 import com.example.domain.repository.RecordingsRepository
 import com.example.domain.repository.SettingsRepository
 import com.example.recorder.RecorderController
+import com.example.recorder.RecordingStateHolder
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
@@ -21,6 +22,7 @@ import kotlinx.coroutines.launch
 data class HomeUiState(
   val recorderState: RecorderState = RecorderState.IDLE,
   val elapsedTimeMs: Long = 0L,
+  val countdownSecondsRemaining: Int = 0,
   val settings: AppSettings = AppSettings(),
   val recentRecordings: List<RecordingItem> = emptyList(),
   val capabilities: DeviceCapabilities,
@@ -44,17 +46,19 @@ class HomeViewModel(
         combine(
           recorderController.state,
           recorderController.elapsedTimeMs,
+          RecordingStateHolder.countdownSecondsRemaining,
           settingsRepository.settings,
-          recordingsRepository.recordings,
-        ) { recState, elapsed, appSettings, allRecordings ->
-          Quad(recState, elapsed, appSettings, allRecordings)
+        ) { recState, elapsed, countdown, appSettings ->
+          Quad(recState, elapsed, countdown, appSettings)
         },
+        recordingsRepository.recordings,
         capabilitiesProvider.resolutionProbeStates,
         capabilitiesProvider.fpsProbeStates,
-      ) { (recState, elapsed, appSettings, allRecordings), resProbes, fpsProbes ->
+      ) { (recState, elapsed, countdown, appSettings), allRecordings, resProbes, fpsProbes ->
         HomeUiState(
           recorderState = recState,
           elapsedTimeMs = elapsed,
+          countdownSecondsRemaining = countdown,
           settings = appSettings,
           recentRecordings =
             allRecordings.sortedByDescending { it.createdAtEpochMs }.take(4),
@@ -75,6 +79,10 @@ class HomeViewModel(
       )
 
   fun onPrimaryRecordAction() {
+    if (RecordingStateHolder.countdownSecondsRemaining.value > 0) {
+      recorderController.stop()
+      return
+    }
     when (recorderController.state.value) {
       RecorderState.IDLE -> recorderController.start()
       RecorderState.RECORDING,
@@ -83,6 +91,7 @@ class HomeViewModel(
   }
 
   fun onPauseResumeAction() {
+    if (RecordingStateHolder.countdownSecondsRemaining.value > 0) return
     when (recorderController.state.value) {
       RecorderState.RECORDING -> recorderController.pause()
       RecorderState.PAUSED -> recorderController.resume()

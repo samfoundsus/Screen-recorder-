@@ -146,6 +146,7 @@ fun HomeScreen(
           RecorderMinimalHero(
             recorderState = uiState.recorderState,
             elapsedTimeMs = uiState.elapsedTimeMs,
+            countdownSecondsRemaining = uiState.countdownSecondsRemaining,
             onPrimaryRecordAction = onPrimaryRecordAction,
             onPauseResumeAction = onPauseResumeAction,
           )
@@ -265,10 +266,12 @@ fun HomeScreen(
 private fun RecorderMinimalHero(
   recorderState: RecorderState,
   elapsedTimeMs: Long,
+  countdownSecondsRemaining: Int,
   onPrimaryRecordAction: () -> Unit,
   onPauseResumeAction: () -> Unit,
 ) {
-  val isIdle = recorderState == RecorderState.IDLE
+  val isIdle = recorderState == RecorderState.IDLE && countdownSecondsRemaining <= 0
+  val isCountingDown = countdownSecondsRemaining > 0
 
   val outerCornerRadius by
     animateDpAsState(
@@ -288,6 +291,13 @@ private fun RecorderMinimalHero(
   val containerColor = MaterialTheme.colorScheme.primaryContainer
   val contentColor = MaterialTheme.colorScheme.onPrimaryContainer
 
+  val timerText =
+    if (isCountingDown) {
+      countdownSecondsRemaining.toString()
+    } else {
+      FormatUtils.formatElapsedTimer(elapsedTimeMs)
+    }
+
   Column(
     modifier =
       Modifier.fillMaxWidth()
@@ -295,7 +305,7 @@ private fun RecorderMinimalHero(
     horizontalAlignment = Alignment.CenterHorizontally,
   ) {
     Text(
-      text = FormatUtils.formatElapsedTimer(elapsedTimeMs),
+      text = timerText,
       style =
         TextStyle(
           fontFamily = FontFamily.SansSerif,
@@ -305,7 +315,12 @@ private fun RecorderMinimalHero(
           letterSpacing = (-1.5).sp,
           fontFeatureSettings = "tnum",
         ),
-      color = MaterialTheme.colorScheme.onSurface,
+      color =
+        if (isCountingDown) {
+          MaterialTheme.colorScheme.primary
+        } else {
+          MaterialTheme.colorScheme.onSurface
+        },
       modifier = Modifier.testTag("home_elapsed_timer"),
     )
 
@@ -316,7 +331,7 @@ private fun RecorderMinimalHero(
       horizontalArrangement = Arrangement.spacedBy(20.dp),
     ) {
       AnimatedVisibility(
-        visible = !isIdle,
+        visible = !isIdle && !isCountingDown,
         enter = fadeIn(animationSpec = tween(150)),
         exit = fadeOut(animationSpec = tween(150)),
       ) {

@@ -21,7 +21,13 @@ data class NavDestinationConfig(
   val enabled: Boolean,
 )
 
+data class GeneralSettings(
+  val showInQuickSettings: Boolean = true,
+  val countdownSeconds: Int = 0,
+)
+
 data class VideoSettings(
+  val performanceMode: String = "Balanced",
   val resolution: String = "1080p",
   val fps: Int = 60,
   val bitrateMbps: Int = 12,
@@ -39,12 +45,12 @@ data class AudioSettings(
 )
 
 data class FloatingControlsSettings(
-  val size: String = "Compact",
+  val size: String = "Medium",
   val opacityPercent: Int = 85,
   val autoHide: Boolean = true,
   val edgeSnapping: Boolean = true,
-  val gestureAction: String = "Double-tap to pause, swipe to dismiss",
-  val invisibleMode: Boolean = false,
+  val keepEdgeHandleWhileRecording: Boolean = true,
+  val hideControlsFromVideo: Boolean = false,
 )
 
 data class AppearanceSettings(
@@ -60,6 +66,7 @@ data class AppearanceSettings(
 )
 
 data class AppSettings(
+  val general: GeneralSettings = GeneralSettings(),
   val video: VideoSettings = VideoSettings(),
   val audio: AudioSettings = AudioSettings(),
   val floatingControls: FloatingControlsSettings = FloatingControlsSettings(),

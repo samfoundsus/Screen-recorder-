@@ -42,21 +42,32 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.foundation.background
+import androidx.compose.foundation.lazy.items
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.BuildConfig
 import com.example.R
 import com.example.domain.model.AppThemeMode
 import com.example.domain.model.MainDestination
 import com.example.domain.model.NavDestinationConfig
 import com.example.domain.model.OptionProbeState
+import com.example.recorder.MemoryDiagnostics
+import com.example.recorder.StopLogManager
+import com.example.recorder.StopRecord
 import com.example.ui.components.pixelGroupedItemShape
+import java.util.Locale
 import kotlin.math.roundToInt
 
 private enum class ActiveSettingsDialog {
   NONE,
+  GENERAL_COUNTDOWN,
+  VIDEO_PERFORMANCE_MODE,
   VIDEO_RESOLUTION,
   VIDEO_FPS,
   VIDEO_BITRATE,
@@ -67,9 +78,10 @@ private enum class ActiveSettingsDialog {
   AUDIO_CHANNELS,
   FLOATING_SIZE,
   FLOATING_OPACITY,
-  FLOATING_GESTURES,
   APPEARANCE_NAV_ORDER,
   APPEARANCE_THEME,
+  ABOUT_MEMORY_DEBUG,
+  ABOUT_STOP_LOG,
   ABOUT_RESET,
 }
 
@@ -80,6 +92,10 @@ fun SettingsScreen(
   onOpenResolutionPicker: () -> Unit,
   onOpenFpsPicker: () -> Unit,
   onRetestDeviceSupport: () -> Unit,
+  onRefreshMemoryDiagnostics: () -> Unit,
+  onUpdateShowInQuickSettings: (Boolean) -> Unit,
+  onUpdateCountdownSeconds: (Int) -> Unit,
+  onUpdatePerformanceMode: (String) -> Unit = {},
   onUpdateResolution: (String) -> Unit,
   onUpdateFps: (Int) -> Unit,
   onUpdateBitrate: (Int) -> Unit,
@@ -94,8 +110,8 @@ fun SettingsScreen(
   onUpdateFloatingOpacity: (Int) -> Unit,
   onUpdateFloatingAutoHide: (Boolean) -> Unit,
   onUpdateFloatingEdgeSnapping: (Boolean) -> Unit,
-  onUpdateFloatingGestures: (String) -> Unit,
-  onUpdateFloatingInvisibleMode: (Boolean) -> Unit,
+  onUpdateFloatingKeepEdgeHandleWhileRecording: (Boolean) -> Unit,
+  onUpdateFloatingHideControlsFromVideo: (Boolean) -> Unit,
   onUpdateThemeMode: (AppThemeMode, Boolean) -> Unit,
   onUpdatePureBlackDark: (Boolean) -> Unit,
   onMoveNavDestination: (Int, Int) -> Unit,
@@ -106,11 +122,19 @@ fun SettingsScreen(
   val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
   var activeDialog by rememberSaveable { mutableStateOf(ActiveSettingsDialog.NONE) }
 
+  LaunchedEffect(Unit) {
+    if (BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED) {
+      onRefreshMemoryDiagnostics()
+    }
+  }
+
+  val general = uiState.settings.general
   val video = uiState.settings.video
   val audio = uiState.settings.audio
   val floating = uiState.settings.floatingControls
   val appearance = uiState.settings.appearance
   val capabilities = uiState.capabilities
+  val memorySnapshot = uiState.memorySnapshot
 
   Scaffold(
     modifier = modifier.fillMaxSize().nestedScroll(scrollBehavior.nestedScrollConnection),
@@ -137,15 +161,60 @@ fun SettingsScreen(
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
       ) {
+        // SECTION 0: GENERAL
+        item(key = "header_general") {
+          PixelSectionHeader(text = stringResource(R.string.settings_section_general))
+        }
+        item(key = "general_quick_settings") {
+          PixelSettingsSwitchRow(
+            title = "Show in Quick Settings",
+            summary =
+              "Swipe down twice from the top of the screen, tap Edit, and drag Screen Recorder to your active tiles",
+            checked = general.showInQuickSettings,
+            onCheckedChange = onUpdateShowInQuickSettings,
+            shape = pixelGroupedItemShape(index = 0, totalCount = 2),
+            testTag = "settings_general_quick_settings",
+          )
+        }
+        item(key = "general_countdown") {
+          val countdownSummary =
+            if (general.countdownSeconds > 0) {
+              "${general.countdownSeconds} seconds (3-2-1 countdown before recording)"
+            } else {
+              "Off (start recording immediately)"
+            }
+          PixelSettingsRow(
+            title = "Countdown",
+            summary = countdownSummary,
+            shape = pixelGroupedItemShape(index = 1, totalCount = 2),
+            onClick = { activeDialog = ActiveSettingsDialog.GENERAL_COUNTDOWN },
+            testTag = "settings_general_countdown",
+          )
+        }
+
         // SECTION 1: VIDEO
         item(key = "header_video") {
           PixelSectionHeader(text = stringResource(R.string.settings_section_video))
+        }
+        item(key = "video_performance_mode") {
+          PixelSettingsRow(
+            title = "Performance mode",
+            summary =
+              if (video.performanceMode == "Gaming") {
+                "Gaming · Lower load on the device so games run smoother while recording."
+              } else {
+                "Balanced"
+              },
+            shape = pixelGroupedItemShape(index = 0, totalCount = 8),
+            onClick = { activeDialog = ActiveSettingsDialog.VIDEO_PERFORMANCE_MODE },
+            testTag = "settings_video_performance_mode",
+          )
         }
         item(key = "video_resolution") {
           PixelSettingsRow(
             title = "Resolution",
             summary = video.resolution,
-            shape = pixelGroupedItemShape(index = 0, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 1, totalCount = 8),
             onClick = {
               onOpenResolutionPicker()
               activeDialog = ActiveSettingsDialog.VIDEO_RESOLUTION
@@ -157,7 +226,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Frame rate",
             summary = "${video.fps} FPS",
-            shape = pixelGroupedItemShape(index = 1, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 2, totalCount = 8),
             onClick = {
               onOpenFpsPicker()
               activeDialog = ActiveSettingsDialog.VIDEO_FPS
@@ -174,7 +243,7 @@ fun SettingsScreen(
               } else {
                 "${video.bitrateMbps} Mbps (auto-scaled)"
               },
-            shape = pixelGroupedItemShape(index = 2, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 3, totalCount = 8),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_BITRATE },
             testTag = "settings_video_bitrate",
           )
@@ -183,7 +252,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Codec",
             summary = video.codec,
-            shape = pixelGroupedItemShape(index = 3, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 4, totalCount = 8),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CODEC },
             testTag = "settings_video_codec",
           )
@@ -192,7 +261,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Container",
             summary = video.container,
-            shape = pixelGroupedItemShape(index = 4, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 5, totalCount = 8),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_CONTAINER },
             testTag = "settings_video_container",
           )
@@ -201,7 +270,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Orientation",
             summary = video.orientation,
-            shape = pixelGroupedItemShape(index = 5, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 6, totalCount = 8),
             onClick = { activeDialog = ActiveSettingsDialog.VIDEO_ORIENTATION },
             testTag = "settings_video_orientation",
           )
@@ -210,7 +279,7 @@ fun SettingsScreen(
           PixelSettingsRow(
             title = "Re-test device support",
             summary = "Clear cached encoder probe results and test again",
-            shape = pixelGroupedItemShape(index = 6, totalCount = 7),
+            shape = pixelGroupedItemShape(index = 7, totalCount = 8),
             onClick = onRetestDeviceSupport,
             testTag = "settings_video_retest_support",
           )
@@ -245,23 +314,36 @@ fun SettingsScreen(
           )
         }
         item(key = "audio_noise_suppression") {
+          val isDeviceAudioOnly =
+            audio.source.equals("Device audio only", ignoreCase = true) ||
+              (audio.source.equals("Device audio + Mic", ignoreCase = true) && !audio.micEnabled)
+          val isMicActive =
+            !isDeviceAudioOnly &&
+              !audio.source.equals("Mute (No audio)", ignoreCase = true) &&
+              (audio.micEnabled || audio.source.contains("Mic", ignoreCase = true))
+          val nsSupported = capabilities.supportsHardwareNoiseSuppression
+          val nsSwitchEnabled = nsSupported && isMicActive
+          val nsChecked = if (!nsSupported) false else audio.noiseSuppression
+          val nsSummary =
+            when {
+              !nsSupported -> "Not supported on this device"
+              !isMicActive -> "Only applies to the microphone."
+              else -> "Reduces background noise in the microphone track."
+            }
+
           PixelSettingsSwitchRow(
             title = "Noise suppression",
-            summary =
-              if (capabilities.supportsHardwareNoiseSuppression) {
-                if (audio.noiseSuppression) "Hardware voice isolation active" else "Off"
-              } else {
-                "Not supported on this device"
-              },
-            checked = audio.noiseSuppression,
+            summary = nsSummary,
+            checked = nsChecked,
             onCheckedChange = onUpdateNoiseSuppression,
             shape = pixelGroupedItemShape(index = 2, totalCount = 4),
             testTag = "settings_audio_noise_suppression",
+            enabled = nsSwitchEnabled,
           )
         }
         item(key = "audio_channels") {
           PixelSettingsRow(
-            title = "Mono / stereo",
+            title = "Channels",
             summary = audio.channelMode,
             shape = pixelGroupedItemShape(index = 3, totalCount = 4),
             onClick = { activeDialog = ActiveSettingsDialog.AUDIO_CHANNELS },
@@ -296,9 +378,9 @@ fun SettingsScreen(
             title = "Auto-hide",
             summary =
               if (floating.autoHide) {
-                "Collapse pill into edge tab after 3 seconds"
+                "Shrink to a thin edge handle after 3 seconds idle"
               } else {
-                "Keep floating controls expanded"
+                "Keep floating controls expanded while idle"
               },
             checked = floating.autoHide,
             onCheckedChange = onUpdateFloatingAutoHide,
@@ -321,28 +403,26 @@ fun SettingsScreen(
             testTag = "settings_floating_edge_snapping",
           )
         }
-        item(key = "floating_gestures") {
-          PixelSettingsRow(
-            title = "Gestures",
-            summary = floating.gestureAction,
+        item(key = "floating_keep_edge_handle_while_recording") {
+          PixelSettingsSwitchRow(
+            title = "Keep edge handle while recording",
+            summary =
+              "A thin handle stays on the screen edge so you can pause or stop. It may appear as a thin dark line in the video on some devices. Turn off to remove the controls completely during recording.",
+            checked = floating.keepEdgeHandleWhileRecording,
+            onCheckedChange = onUpdateFloatingKeepEdgeHandleWhileRecording,
             shape = pixelGroupedItemShape(index = 4, totalCount = 6),
-            onClick = { activeDialog = ActiveSettingsDialog.FLOATING_GESTURES },
-            testTag = "settings_floating_gestures",
+            testTag = "settings_floating_keep_edge_handle_while_recording",
           )
         }
-        item(key = "floating_invisible_mode") {
+        item(key = "floating_hide_controls_from_video") {
           PixelSettingsSwitchRow(
-            title = "Invisible mode",
+            title = "Hide controls from video (experimental)",
             summary =
-              if (floating.invisibleMode) {
-                "Floating controls omitted from output recording"
-              } else {
-                "Floating controls visible in recorded video"
-              },
-            checked = floating.invisibleMode,
-            onCheckedChange = onUpdateFloatingInvisibleMode,
+              "Tries to keep the controls out of the recorded video. They may look like a black box on screen in some previews, and results vary by device.",
+            checked = floating.hideControlsFromVideo,
+            onCheckedChange = onUpdateFloatingHideControlsFromVideo,
             shape = pixelGroupedItemShape(index = 5, totalCount = 6),
-            testTag = "settings_floating_invisible_mode",
+            testTag = "settings_floating_hide_controls_from_video",
           )
         }
 
@@ -389,32 +469,69 @@ fun SettingsScreen(
         }
 
         // SECTION 5: ABOUT
+        val hasMemoryDebug = BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED
+        val hasStopLog = BuildConfig.DEBUG
+        val aboutTotalCount = 2 + (if (hasMemoryDebug) 1 else 0) + (if (hasStopLog) 1 else 0) + 1
+        var nextAboutIndex = 0
+
         item(key = "header_about") {
           PixelSectionHeader(text = stringResource(R.string.settings_section_about))
         }
         item(key = "about_version") {
+          val currentIndex = nextAboutIndex++
           PixelSettingsRow(
             title = "Version",
-            summary = "1.0.0-phase1 (Pixel UI Architecture)",
-            shape = pixelGroupedItemShape(index = 0, totalCount = 3),
+            summary = "${BuildConfig.VERSION_NAME} (Pixel UI Architecture)",
+            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
             onClick = {},
             testTag = "settings_about_version",
           )
         }
         item(key = "about_hardware") {
+          val currentIndex = nextAboutIndex++
           PixelSettingsRow(
             title = "Device capability profile",
             summary = "${capabilities.deviceModelSummary} (${capabilities.hardwareEncoderSummary})",
-            shape = pixelGroupedItemShape(index = 1, totalCount = 3),
+            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
             onClick = {},
             testTag = "settings_about_hardware",
           )
         }
+        if (hasMemoryDebug) {
+          item(key = "about_memory_debug") {
+            val currentIndex = nextAboutIndex++
+            PixelSettingsRow(
+              title = "Memory (debug)",
+              summary = memorySnapshot.summaryText,
+              shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+              onClick = {
+                onRefreshMemoryDiagnostics()
+                activeDialog = ActiveSettingsDialog.ABOUT_MEMORY_DEBUG
+              },
+              testTag = "settings_about_memory_debug",
+            )
+          }
+        }
+        if (hasStopLog) {
+          item(key = "about_stop_log") {
+            val currentIndex = nextAboutIndex++
+            PixelSettingsRow(
+              title = "Stop log",
+              summary = "View reasons and diagnostics for the last 10 stops",
+              shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
+              onClick = {
+                activeDialog = ActiveSettingsDialog.ABOUT_STOP_LOG
+              },
+              testTag = "settings_about_stop_log",
+            )
+          }
+        }
         item(key = "about_reset") {
+          val currentIndex = nextAboutIndex++
           PixelSettingsRow(
             title = "Reset preferences",
             summary = "Restore default video, audio, and navigation settings",
-            shape = pixelGroupedItemShape(index = 2, totalCount = 3),
+            shape = pixelGroupedItemShape(index = currentIndex, totalCount = aboutTotalCount),
             onClick = { activeDialog = ActiveSettingsDialog.ABOUT_RESET },
             testTag = "settings_about_reset",
           )
@@ -430,6 +547,33 @@ fun SettingsScreen(
   // DIALOGS
   when (activeDialog) {
     ActiveSettingsDialog.NONE -> Unit
+    ActiveSettingsDialog.GENERAL_COUNTDOWN -> {
+      val selectedLabel = if (general.countdownSeconds > 0) "3 seconds" else "Off"
+      SingleChoiceSettingsDialog(
+        title = "Countdown before recording",
+        options = listOf("Off", "3 seconds"),
+        selectedOption = selectedLabel,
+        onSelect = { choice ->
+          onUpdateCountdownSeconds(if (choice.startsWith("3")) 3 else 0)
+          activeDialog = ActiveSettingsDialog.NONE
+        },
+        onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
+      )
+    }
+    ActiveSettingsDialog.VIDEO_PERFORMANCE_MODE -> {
+      SingleChoiceSettingsDialog(
+        title = "Performance mode",
+        options = listOf("Balanced", "Gaming"),
+        selectedOption = video.performanceMode,
+        optionSummaries =
+          mapOf("Gaming" to "Lower load on the device so games run smoother while recording."),
+        onSelect = { choice ->
+          onUpdatePerformanceMode(choice)
+          activeDialog = ActiveSettingsDialog.NONE
+        },
+        onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
+      )
+    }
     ActiveSettingsDialog.VIDEO_RESOLUTION -> {
       LaunchedEffect(Unit) {
         onOpenResolutionPicker()
@@ -522,8 +666,8 @@ fun SettingsScreen(
     }
     ActiveSettingsDialog.AUDIO_CHANNELS -> {
       SingleChoiceSettingsDialog(
-        title = "Mono / stereo",
-        options = capabilities.supportedAudioChannels,
+        title = "Channels",
+        options = listOf("Mono", "Stereo"),
         selectedOption = audio.channelMode,
         onSelect = {
           onUpdateAudioChannels(it)
@@ -535,7 +679,7 @@ fun SettingsScreen(
     ActiveSettingsDialog.FLOATING_SIZE -> {
       SingleChoiceSettingsDialog(
         title = "Floating control size",
-        options = listOf("Mini", "Compact", "Large"),
+        options = listOf("Small", "Medium", "Large"),
         selectedOption = floating.size,
         onSelect = {
           onUpdateFloatingSize(it)
@@ -549,24 +693,6 @@ fun SettingsScreen(
         currentOpacity = floating.opacityPercent,
         onConfirm = {
           onUpdateFloatingOpacity(it)
-          activeDialog = ActiveSettingsDialog.NONE
-        },
-        onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
-      )
-    }
-    ActiveSettingsDialog.FLOATING_GESTURES -> {
-      SingleChoiceSettingsDialog(
-        title = "Floating control gestures",
-        options =
-          listOf(
-            "Double-tap to pause, swipe to dismiss",
-            "Single-tap to pause, long-press to stop",
-            "Double-tap to stop, drag to dock",
-            "Gestures disabled",
-          ),
-        selectedOption = floating.gestureAction,
-        onSelect = {
-          onUpdateFloatingGestures(it)
           activeDialog = ActiveSettingsDialog.NONE
         },
         onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
@@ -589,6 +715,144 @@ fun SettingsScreen(
           activeDialog = ActiveSettingsDialog.NONE
         },
         onDismiss = { activeDialog = ActiveSettingsDialog.NONE },
+      )
+    }
+    ActiveSettingsDialog.ABOUT_MEMORY_DEBUG -> {
+      if (BuildConfig.DEBUG && MemoryDiagnostics.IS_ENABLED) {
+        val nativeMb =
+          String.format(Locale.US, "%.1f MB", memorySnapshot.nativeHeapAllocatedKb / 1024.0)
+        val javaMb =
+          String.format(Locale.US, "%.1f MB", memorySnapshot.javaHeapUsedKb / 1024.0)
+        AlertDialog(
+          onDismissRequest = { activeDialog = ActiveSettingsDialog.NONE },
+          title = { Text("Memory (debug)") },
+          text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+              Text(
+                text =
+                  "Recorder process PSS: ${memorySnapshot.recorderPssMbText}" +
+                    if (memorySnapshot.recorderPssKb > 0) " (${memorySnapshot.recorderPssKb} KB)" else "",
+                style = MaterialTheme.typography.bodyMedium,
+              )
+              Text(
+                text = "UI process PSS: ${memorySnapshot.uiPssMbText} (${memorySnapshot.uiPssKb} KB)",
+                style = MaterialTheme.typography.bodyMedium,
+              )
+              Text(
+                text =
+                  "Peak recorder PSS: ${memorySnapshot.peakLastRecordingPssMbText}" +
+                    if (memorySnapshot.peakLastRecordingPssKb > 0) {
+                      " (${memorySnapshot.peakLastRecordingPssKb} KB)"
+                    } else {
+                      ""
+                    },
+                style = MaterialTheme.typography.bodyMedium,
+              )
+              Text(
+                text =
+                  "Native heap allocated: $nativeMb (${memorySnapshot.nativeHeapAllocatedKb} KB / ${memorySnapshot.nativeHeapSizeKb} KB)",
+                style = MaterialTheme.typography.bodyMedium,
+              )
+              Text(
+                text = "Java heap used: $javaMb (${memorySnapshot.javaHeapUsedKb} KB)",
+                style = MaterialTheme.typography.bodyMedium,
+              )
+              Text(
+                text =
+                  "Active codecs: ${memorySnapshot.activeCodecs} • Active threads: ${memorySnapshot.activeThreads}",
+                style = MaterialTheme.typography.bodyMedium,
+              )
+            }
+          },
+          confirmButton = {
+            TextButton(onClick = { activeDialog = ActiveSettingsDialog.NONE }) {
+              Text("Close")
+            }
+          },
+          dismissButton = {
+            TextButton(onClick = onRefreshMemoryDiagnostics) {
+              Text("Refresh")
+            }
+          },
+        )
+      } else {
+        activeDialog = ActiveSettingsDialog.NONE
+      }
+    }
+    ActiveSettingsDialog.ABOUT_STOP_LOG -> {
+      val context = LocalContext.current
+      val recentStops = remember { StopLogManager.getRecentStops(context) }
+      AlertDialog(
+        onDismissRequest = { activeDialog = ActiveSettingsDialog.NONE },
+        title = { Text("Recording stop log") },
+        text = {
+          if (recentStops.isEmpty()) {
+            Text(
+              text = "No recorded stop events yet.",
+              style = MaterialTheme.typography.bodyMedium,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+          } else {
+            LazyColumn(
+              modifier = Modifier.fillMaxWidth(),
+              verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+              items(recentStops) { stop ->
+                Surface(
+                  shape = RoundedCornerShape(12.dp),
+                  color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                  modifier = Modifier.fillMaxWidth(),
+                ) {
+                  Column(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                  ) {
+                    Row(
+                      modifier = Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                      Text(
+                        text = stop.reason.formattedReason(),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface,
+                      )
+                      Text(
+                        text = stop.formatDuration(),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                      )
+                    }
+                    val message = stop.reason.message
+                    if (!message.isNullOrBlank()) {
+                      Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                      )
+                    }
+                    Text(
+                      text = "${stop.resolution} • ${stop.fps} fps • ${stop.codec} • ${stop.bitrateMbps} Mbps",
+                      style = MaterialTheme.typography.bodySmall,
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                      text = stop.formatDateTime(),
+                      style = MaterialTheme.typography.labelSmall,
+                      color = MaterialTheme.colorScheme.outline,
+                    )
+                  }
+                }
+              }
+            }
+          }
+        },
+        confirmButton = {
+          TextButton(onClick = { activeDialog = ActiveSettingsDialog.NONE }) {
+            Text("Close")
+          }
+        },
       )
     }
     ActiveSettingsDialog.ABOUT_RESET -> {
@@ -662,7 +926,7 @@ private fun PixelSettingsRow(
         text = summary,
         style = MaterialTheme.typography.bodyMedium,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
-        maxLines = 1,
+        maxLines = 4,
         overflow = TextOverflow.Ellipsis,
       )
     }
@@ -677,6 +941,7 @@ private fun PixelSettingsSwitchRow(
   onCheckedChange: (Boolean) -> Unit,
   shape: Shape,
   testTag: String,
+  enabled: Boolean = true,
 ) {
   Surface(
     shape = shape,
@@ -684,7 +949,7 @@ private fun PixelSettingsSwitchRow(
     modifier =
       Modifier.fillMaxWidth()
         .clip(shape)
-        .clickable { onCheckedChange(!checked) }
+        .clickable(enabled = enabled) { onCheckedChange(!checked) }
         .testTag(testTag),
   ) {
     Row(
@@ -695,7 +960,12 @@ private fun PixelSettingsSwitchRow(
         Text(
           text = title,
           style = MaterialTheme.typography.titleMedium,
-          color = MaterialTheme.colorScheme.onSurface,
+          color =
+            if (enabled) {
+              MaterialTheme.colorScheme.onSurface
+            } else {
+              MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+            },
           maxLines = 1,
           overflow = TextOverflow.Ellipsis,
         )
@@ -703,8 +973,13 @@ private fun PixelSettingsSwitchRow(
         Text(
           text = summary,
           style = MaterialTheme.typography.bodyMedium,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
-          maxLines = 1,
+          color =
+            if (enabled) {
+              MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+              MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+            },
+          maxLines = 4,
           overflow = TextOverflow.Ellipsis,
         )
       }
@@ -712,6 +987,7 @@ private fun PixelSettingsSwitchRow(
       Switch(
         checked = checked,
         onCheckedChange = onCheckedChange,
+        enabled = enabled,
         thumbContent = null,
       )
     }
@@ -919,6 +1195,7 @@ private fun SingleChoiceSettingsDialog(
   title: String,
   options: List<String>,
   selectedOption: String,
+  optionSummaries: Map<String, String>? = null,
   onSelect: (String) -> Unit,
   onDismiss: () -> Unit,
 ) {
@@ -928,6 +1205,7 @@ private fun SingleChoiceSettingsDialog(
     text = {
       Column {
         options.forEach { option ->
+          val summary = optionSummaries?.get(option)
           Row(
             modifier =
               Modifier.fillMaxWidth()
@@ -941,12 +1219,24 @@ private fun SingleChoiceSettingsDialog(
               onClick = null,
             )
             Spacer(modifier = Modifier.width(12.dp))
-            Text(
-              text = option,
-              style = MaterialTheme.typography.bodyLarge,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis,
-            )
+            Column(modifier = Modifier.weight(1f)) {
+              Text(
+                text = option,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+              )
+              if (!summary.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                  text = summary,
+                  style = MaterialTheme.typography.bodySmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                  maxLines = 2,
+                  overflow = TextOverflow.Ellipsis,
+                )
+              }
+            }
           }
         }
       }
@@ -1184,7 +1474,7 @@ private fun ThemePickerDialog(
                 maxLines = 1,
               )
               Text(
-                text = "Use Material You wallpaper palette",
+                text = "Match wallpaper palette on Android 12+",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,

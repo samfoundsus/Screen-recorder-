@@ -52,6 +52,11 @@ data class VideoMetadata(
   val fps: Int?,
   val bitrateMbps: Int?,
   val codec: String,
+  val hasAudio: Boolean = true,
+  val audioChannelMode: String = "Stereo",
+  val noiseSuppression: Boolean = false,
+  val measuredAvgFps: Double? = null,
+  val requestedFps: Int? = null,
 )
 
 data class RecordingItem(
@@ -67,6 +72,7 @@ data class RecordingItem(
   val container: String,
   val hasMicAudio: Boolean,
   val audioChannelMode: String,
+  val noiseSuppression: Boolean = false,
   val category: RecordingCategory,
   val accentHue: Float,
   val contentUri: String,

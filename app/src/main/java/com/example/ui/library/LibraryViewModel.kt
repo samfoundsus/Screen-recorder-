@@ -58,26 +58,14 @@ class LibraryViewModel(
         val now = System.currentTimeMillis()
         val dayMs = 86_400_000L
 
-        val distinctCategories = allItems.map { it.category }.toSet()
         val visibleCategoryChips =
-          if (distinctCategories.size > 1) {
-            listOf(RecordingCategory.ALL) +
-              RecordingCategory.entries.filter {
-                it != RecordingCategory.ALL && it in distinctCategories
-              }
+          if (allItems.isNotEmpty()) {
+            RecordingCategory.entries.toList()
           } else {
             emptyList()
           }
 
-        val effectiveCategory =
-          if (
-            criteria.category != RecordingCategory.ALL &&
-              criteria.category !in distinctCategories
-          ) {
-            RecordingCategory.ALL
-          } else {
-            criteria.category
-          }
+        val effectiveCategory = criteria.category
 
         val filtered =
           allItems
@@ -190,6 +178,15 @@ class LibraryViewModel(
     }
     selectedIds.value = emptySet()
     showDeleteDialog.value = false
+  }
+
+  fun renameRecording(id: String, newTitle: String) {
+    recordingsRepository.renameRecording(id, newTitle)
+  }
+
+  fun deleteSingleRecording(id: String) {
+    recordingsRepository.deleteRecordings(setOf(id))
+    selectedIds.update { it - id }
   }
 
   fun clearAllFilters() {

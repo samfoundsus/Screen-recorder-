@@ -27,8 +27,13 @@ class PlaybackViewModel(
       .stateIn(
         scope = viewModelScope,
         started = SharingStarted.WhileSubscribed(5_000),
-        initialValue = PlaybackUiState(recording = recordingsRepository.getRecordingById(recordingId)),
+        initialValue =
+          PlaybackUiState(recording = recordingsRepository.getRecordingById(recordingId)),
       )
+
+  fun renameRecording(newTitle: String) {
+    recordingsRepository.renameRecording(recordingId, newTitle)
+  }
 
   fun deleteRecording(onDeleted: () -> Unit) {
     recordingsRepository.deleteRecordings(setOf(recordingId))

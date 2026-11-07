@@ -4,11 +4,14 @@ import com.example.domain.model.AppSettings
 import com.example.domain.model.AppearanceSettings
 import com.example.domain.model.AudioSettings
 import com.example.domain.model.FloatingControlsSettings
+import com.example.domain.model.GeneralSettings
 import com.example.domain.model.VideoSettings
 import kotlinx.coroutines.flow.Flow
 
 interface SettingsRepository {
   val settings: Flow<AppSettings>
+
+  suspend fun updateGeneralSettings(transform: (GeneralSettings) -> GeneralSettings)
 
   suspend fun updateVideoSettings(transform: (VideoSettings) -> VideoSettings)
 

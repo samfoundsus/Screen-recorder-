@@ -16,6 +16,7 @@ import com.example.domain.model.AppThemeMode
 import com.example.domain.model.AppearanceSettings
 import com.example.domain.model.AudioSettings
 import com.example.domain.model.FloatingControlsSettings
+import com.example.domain.model.GeneralSettings
 import com.example.domain.model.MainDestination
 import com.example.domain.model.NavDestinationConfig
 import com.example.domain.model.VideoSettings
@@ -35,7 +36,12 @@ private val Context.dataStore: DataStore<Preferences> by
 class DataStoreSettingsRepository(private val context: Context) : SettingsRepository {
 
   private object Keys {
+    // General
+    val GENERAL_SHOW_IN_QUICK_SETTINGS = booleanPreferencesKey("general_show_in_quick_settings")
+    val GENERAL_COUNTDOWN_SECONDS = intPreferencesKey("general_countdown_seconds")
+
     // Video
+    val VIDEO_PERFORMANCE_MODE = stringPreferencesKey("video_performance_mode")
     val VIDEO_RESOLUTION = stringPreferencesKey("video_resolution")
     val VIDEO_FPS = intPreferencesKey("video_fps")
     val VIDEO_BITRATE = intPreferencesKey("video_bitrate_mbps")
@@ -55,8 +61,10 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     val FLOATING_OPACITY = intPreferencesKey("floating_opacity")
     val FLOATING_AUTO_HIDE = booleanPreferencesKey("floating_auto_hide")
     val FLOATING_EDGE_SNAPPING = booleanPreferencesKey("floating_edge_snapping")
-    val FLOATING_GESTURES = stringPreferencesKey("floating_gestures")
-    val FLOATING_INVISIBLE = booleanPreferencesKey("floating_invisible_mode")
+    val FLOATING_KEEP_EDGE_HANDLE_WHILE_RECORDING =
+      booleanPreferencesKey("floating_keep_edge_handle_while_recording")
+    val FLOATING_HIDE_CONTROLS_FROM_VIDEO =
+      booleanPreferencesKey("floating_hide_controls_from_video")
 
     // Appearance
     val APPEARANCE_THEME = stringPreferencesKey("appearance_theme")
@@ -79,6 +87,15 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
       }
       .map { prefs -> mapPreferencesToSettings(prefs) }
 
+  override suspend fun updateGeneralSettings(transform: (GeneralSettings) -> GeneralSettings) {
+    val current = settings.first().general
+    val updated = transform(current)
+    context.dataStore.edit { prefs ->
+      prefs[Keys.GENERAL_SHOW_IN_QUICK_SETTINGS] = updated.showInQuickSettings
+      prefs[Keys.GENERAL_COUNTDOWN_SECONDS] = updated.countdownSeconds.coerceIn(0, 10)
+    }
+  }
+
   override suspend fun updateVideoSettings(transform: (VideoSettings) -> VideoSettings) {
     val current = settings.first().video
     val updated = transform(current)
@@ -90,6 +107,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         computeDefaultBitrateMbps(normalizedRes, updated.fps)
       }
     context.dataStore.edit { prefs ->
+      prefs[Keys.VIDEO_PERFORMANCE_MODE] = updated.performanceMode
       prefs[Keys.VIDEO_RESOLUTION] = normalizedRes
       prefs[Keys.VIDEO_FPS] = updated.fps
       prefs[Keys.VIDEO_BITRATE] = effectiveBitrateMbps
@@ -117,12 +135,14 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     val current = settings.first().floatingControls
     val updated = transform(current)
     context.dataStore.edit { prefs ->
-      prefs[Keys.FLOATING_SIZE] = updated.size
-      prefs[Keys.FLOATING_OPACITY] = updated.opacityPercent
+      prefs[Keys.FLOATING_SIZE] = normalizeFloatingSizeOption(updated.size)
+      prefs[Keys.FLOATING_OPACITY] = updated.opacityPercent.coerceIn(20, 100)
       prefs[Keys.FLOATING_AUTO_HIDE] = updated.autoHide
       prefs[Keys.FLOATING_EDGE_SNAPPING] = updated.edgeSnapping
-      prefs[Keys.FLOATING_GESTURES] = updated.gestureAction
-      prefs[Keys.FLOATING_INVISIBLE] = updated.invisibleMode
+      prefs[Keys.FLOATING_KEEP_EDGE_HANDLE_WHILE_RECORDING] =
+        updated.keepEdgeHandleWhileRecording
+      prefs[Keys.FLOATING_HIDE_CONTROLS_FROM_VIDEO] =
+        updated.hideControlsFromVideo
     }
   }
 
@@ -192,11 +212,21 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
   }
 
   private fun mapPreferencesToSettings(prefs: Preferences): AppSettings {
+    val defaultGeneral = GeneralSettings()
     val defaultVideo = VideoSettings()
     val defaultAudio = AudioSettings()
     val defaultFloating = FloatingControlsSettings()
     val defaultAppearance = AppearanceSettings()
 
+    val general =
+      GeneralSettings(
+        showInQuickSettings =
+          prefs[Keys.GENERAL_SHOW_IN_QUICK_SETTINGS] ?: defaultGeneral.showInQuickSettings,
+        countdownSeconds =
+          (prefs[Keys.GENERAL_COUNTDOWN_SECONDS] ?: defaultGeneral.countdownSeconds).coerceIn(0, 10),
+      )
+
+    val performanceMode = prefs[Keys.VIDEO_PERFORMANCE_MODE] ?: defaultVideo.performanceMode
     val resolution =
       normalizeResolutionOption(prefs[Keys.VIDEO_RESOLUTION] ?: defaultVideo.resolution)
     val fps = prefs[Keys.VIDEO_FPS] ?: defaultVideo.fps
@@ -210,6 +240,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     val video =
       VideoSettings(
+        performanceMode = performanceMode,
         resolution = resolution,
         fps = fps,
         bitrateMbps = bitrateMbps,
@@ -229,12 +260,17 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     val floating =
       FloatingControlsSettings(
-        size = prefs[Keys.FLOATING_SIZE] ?: defaultFloating.size,
-        opacityPercent = prefs[Keys.FLOATING_OPACITY] ?: defaultFloating.opacityPercent,
+        size = normalizeFloatingSizeOption(prefs[Keys.FLOATING_SIZE] ?: defaultFloating.size),
+        opacityPercent =
+          (prefs[Keys.FLOATING_OPACITY] ?: defaultFloating.opacityPercent).coerceIn(20, 100),
         autoHide = prefs[Keys.FLOATING_AUTO_HIDE] ?: defaultFloating.autoHide,
         edgeSnapping = prefs[Keys.FLOATING_EDGE_SNAPPING] ?: defaultFloating.edgeSnapping,
-        gestureAction = prefs[Keys.FLOATING_GESTURES] ?: defaultFloating.gestureAction,
-        invisibleMode = prefs[Keys.FLOATING_INVISIBLE] ?: defaultFloating.invisibleMode,
+        keepEdgeHandleWhileRecording =
+          prefs[Keys.FLOATING_KEEP_EDGE_HANDLE_WHILE_RECORDING]
+            ?: defaultFloating.keepEdgeHandleWhileRecording,
+        hideControlsFromVideo =
+          prefs[Keys.FLOATING_HIDE_CONTROLS_FROM_VIDEO]
+            ?: defaultFloating.hideControlsFromVideo,
       )
 
     val themeMode =
@@ -255,11 +291,20 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
       )
 
     return AppSettings(
+      general = general,
       video = video,
       audio = audio,
       floatingControls = floating,
       appearance = appearance,
     )
+  }
+
+  private fun normalizeFloatingSizeOption(raw: String): String {
+    return when {
+      raw.equals("Small", ignoreCase = true) || raw.equals("Mini", ignoreCase = true) -> "Small"
+      raw.equals("Large", ignoreCase = true) -> "Large"
+      else -> "Medium"
+    }
   }
 
   private fun normalizeResolutionOption(raw: String): String {

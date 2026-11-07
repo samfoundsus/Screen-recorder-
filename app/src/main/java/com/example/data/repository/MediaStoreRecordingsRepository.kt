@@ -49,6 +49,8 @@ class MediaStoreRecordingsRepository(
   override val deletePermissionRequests: SharedFlow<IntentSender> =
     _deletePermissionRequests.asSharedFlow()
 
+  @Volatile private var pendingRenameOperation: Pair<Uri, String>? = null
+
   private val mediaStoreObserver =
     object : ContentObserver(Handler(Looper.getMainLooper())) {
       override fun onChange(selfChange: Boolean) {
@@ -65,11 +67,16 @@ class MediaStoreRecordingsRepository(
       _recordings.update { currentList ->
         currentList.map { item ->
           if (item.contentUri == uriString) {
+            val nextFps = meta.fps ?: item.fps
             item.copy(
               resolution = meta.resolution ?: item.resolution,
-              fps = meta.fps ?: item.fps,
+              fps = nextFps,
               bitrateMbps = meta.bitrateMbps ?: item.bitrateMbps,
               codec = meta.codec,
+              hasMicAudio = meta.hasAudio,
+              audioChannelMode = meta.audioChannelMode,
+              noiseSuppression = meta.noiseSuppression,
+              category = inferCategory(item.title, item.durationMs, nextFps),
             )
           } else {
             item
@@ -95,10 +102,26 @@ class MediaStoreRecordingsRepository(
 
   override fun refresh() {
     repositoryScope.launch {
+      pendingRenameOperation?.let { (uri, newDisplayName) ->
+        pendingRenameOperation = null
+        try {
+          val values =
+            ContentValues().apply {
+              put(MediaStore.Video.Media.DISPLAY_NAME, newDisplayName)
+            }
+          contentResolver.update(uri, values, null, null)
+        } catch (_: Throwable) {}
+      }
+
       val items = queryRecordingsFromMediaStore()
       _recordings.value = items
       items.forEach { item ->
-        if ((item.fps == null || item.fps <= 0) && item.contentUri.isNotBlank()) {
+        if (
+          item.contentUri.isNotBlank() &&
+            (item.fps == null ||
+              item.fps <= 0 ||
+              RecordingMediaCache.getCachedMetadata(item.contentUri) == null)
+        ) {
           RecordingMediaCache.loadMetadata(appContext, item.contentUri)
         }
       }
@@ -158,8 +181,22 @@ class MediaStoreRecordingsRepository(
           ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, newDisplayName)
           }
-        contentResolver.update(uri, values, null, null)
-        _recordings.value = queryRecordingsFromMediaStore()
+        val updated = contentResolver.update(uri, values, null, null)
+        if (updated > 0) {
+          _recordings.value = queryRecordingsFromMediaStore()
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+          pendingRenameOperation = uri to newDisplayName
+          val writeIntent = MediaStore.createWriteRequest(contentResolver, listOf(uri))
+          _deletePermissionRequests.tryEmit(writeIntent.intentSender)
+        }
+      } catch (_: SecurityException) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+          try {
+            pendingRenameOperation = uri to newDisplayName
+            val writeIntent = MediaStore.createWriteRequest(contentResolver, listOf(uri))
+            _deletePermissionRequests.tryEmit(writeIntent.intentSender)
+          } catch (_: Throwable) {}
+        }
       } catch (_: Throwable) {}
     }
   }
@@ -170,6 +207,29 @@ class MediaStoreRecordingsRepository(
     }
     val numericId = id.removePrefix("ms_").toLongOrNull() ?: id.toLongOrNull() ?: return null
     return ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, numericId)
+  }
+
+  private fun inferCategory(
+    title: String,
+    durationMs: Long,
+    fps: Int?,
+  ): RecordingCategory {
+    val lower = title.lowercase(Locale.US)
+    return when {
+      lower.contains("tutorial") ||
+        lower.contains("walkthrough") ||
+        lower.contains("guide") ||
+        lower.contains("demo") -> RecordingCategory.TUTORIALS
+      lower.contains("game") ||
+        lower.contains("gameplay") ||
+        (fps != null && fps >= 90) -> RecordingCategory.GAMES
+      lower.contains("system") ||
+        lower.contains("launcher") ||
+        lower.contains("ui") ||
+        lower.contains("settings") -> RecordingCategory.SYSTEM
+      durationMs in 1L..45_000L -> RecordingCategory.CLIPS
+      else -> RecordingCategory.SYSTEM
+    }
   }
 
   private fun queryRecordingsFromMediaStore(): List<RecordingItem> {
@@ -273,6 +333,8 @@ class MediaStoreRecordingsRepository(
               else -> "1080p"
             }
 
+          val resolvedFps = cachedMeta?.fps ?: mediaStoreFps
+
           result.add(
             RecordingItem(
               id = mediaId.toString(),
@@ -281,13 +343,14 @@ class MediaStoreRecordingsRepository(
               durationMs = durationMs,
               sizeBytes = sizeBytes,
               resolution = resolutionLabel,
-              fps = cachedMeta?.fps ?: mediaStoreFps,
+              fps = resolvedFps,
               bitrateMbps = cachedMeta?.bitrateMbps,
               codec = cachedMeta?.codec ?: "AVC (H.264)",
               container = extension,
-              hasMicAudio = true,
-              audioChannelMode = "Stereo",
-              category = RecordingCategory.CLIPS,
+              hasMicAudio = cachedMeta?.hasAudio ?: true,
+              audioChannelMode = cachedMeta?.audioChannelMode ?: "Stereo",
+              noiseSuppression = cachedMeta?.noiseSuppression ?: false,
+              category = inferCategory(title, durationMs, resolvedFps),
               accentHue = ((mediaId * 47L) % 360L).toFloat(),
               contentUri = uriString,
             )

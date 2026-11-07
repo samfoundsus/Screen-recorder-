@@ -18,8 +18,8 @@ android {
     applicationId = "com.aistudio.screenrecorder.pxlrec"
     minSdk = 29
     targetSdk = 34
-    versionCode = 1000 + runNumber
-    versionName = "1.0.$runNumber"
+    versionCode = 1000 + runNumber + 4
+    versionName = "1.0.${runNumber + 4}"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -113,6 +113,7 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.ui)
   implementation(libs.androidx.media3.common)
+  implementation(libs.material)
   // implementation(libs.androidx.room.ktx)
   // implementation(libs.androidx.room.runtime)
   // implementation(libs.coil.compose)

@@ -11,6 +11,7 @@
     <string name="home_view_all">View all</string>
     <string name="library_search_hint">Search recordings</string>
     <string name="library_delete_confirm_title">Delete selected recordings?</string>
+    <string name="settings_section_general">General</string>
     <string name="settings_section_video">Video</string>
     <string name="settings_section_audio">Audio</string>
     <string name="settings_section_floating">Floating controls</string>

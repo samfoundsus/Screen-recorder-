@@ -2,6 +2,7 @@ package com.example.recorder
 
 import android.content.Context
 import com.example.domain.model.RecorderState
+import com.example.recorder.ipc.RecorderClient
 import kotlinx.coroutines.flow.StateFlow
 
 class RealRecorderController(
@@ -21,18 +22,27 @@ class RealRecorderController(
 
   override fun pause() {
     if (state.value != RecorderState.RECORDING) return
-    appContext.startService(RecorderService.createPauseIntent(appContext))
+    RecorderClient.getInstance(appContext).pause()
+    try {
+      appContext.startService(RecorderService.createPauseIntent(appContext))
+    } catch (_: Throwable) {}
   }
 
   override fun resume() {
     if (state.value != RecorderState.PAUSED) return
-    appContext.startService(RecorderService.createResumeIntent(appContext))
+    RecorderClient.getInstance(appContext).resume()
+    try {
+      appContext.startService(RecorderService.createResumeIntent(appContext))
+    } catch (_: Throwable) {}
   }
 
   override fun stop(): Long {
     if (state.value == RecorderState.IDLE) return 0L
     val finalElapsed = elapsedTimeMs.value
-    appContext.startService(RecorderService.createStopIntent(appContext))
+    RecorderClient.getInstance(appContext).stop()
+    try {
+      appContext.startService(RecorderService.createStopIntent(appContext))
+    } catch (_: Throwable) {}
     return finalElapsed
   }
 }
